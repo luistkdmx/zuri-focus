@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/Elementos de la solución/">
+    <File Path=".gitignore" />
+  </Folder>
+  <Project Path="ZuriFocus.Monitor/ZuriFocus.Monitor.csproj" Id="7887a8b9-2289-4ee3-9d2c-5856496e144f" />
+  <Project Path="ZuriFocus.Reporter/ZuriFocus.Reporter.csproj" Id="9b776785-9ade-4f65-b06f-79331ccd3d9c" />
+</Solution>
