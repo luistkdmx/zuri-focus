@@ -4,7 +4,10 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Timers;
+
+// Alias para evitar conflictos de Timer
+using Timer = System.Timers.Timer;
+using ElapsedEventArgs = System.Timers.ElapsedEventArgs;
 
 namespace ZuriFocus.Monitor
 {
@@ -12,7 +15,7 @@ namespace ZuriFocus.Monitor
     {
         static void Main(string[] args)
         {
-            Console.Title = "ZuriFocus Monitor - Sesión con activo/idle";
+            Console.Title = "ZuriFocus Monitor - Sesión con activo/idle y apps";
             Console.WriteLine("ZuriFocus Monitor iniciado...");
             Console.WriteLine();
 
@@ -34,16 +37,20 @@ namespace ZuriFocus.Monitor
             Console.WriteLine($"Inicio de sesión: {currentSession.Start:yyyy-MM-dd HH:mm:ss}");
             Console.WriteLine();
             Console.WriteLine("Monitoreando sesión actual...");
-            Console.WriteLine("Regla: si pasan 60 segundos sin mover mouse/teclado, se cuenta como 'idle'.");
+            Console.WriteLine(" - Idle: si pasan 60 segundos sin mover mouse/teclado, se cuenta como inactivo.");
+            Console.WriteLine(" - Apps: se mide qué proceso está en primer plano (chrome, excel, etc.).");
             Console.WriteLine("Cuando quieras terminar la sesión, presiona ENTER.");
             Console.WriteLine();
 
             // Cronómetro de duración total de la sesión
             Stopwatch stopwatch = Stopwatch.StartNew();
 
-            // Tracker de actividad / idle
+            // Trackers de actividad / idle y aplicaciones
             IdleTracker idleTracker = new IdleTracker(idleThresholdSeconds: 60);
+            AppTracker appTracker = new AppTracker();
+
             idleTracker.Start();
+            appTracker.Start();
 
             // Esperamos a que el usuario presione ENTER para terminar la sesión
             Console.ReadLine();
@@ -51,6 +58,7 @@ namespace ZuriFocus.Monitor
             // Paramos todo
             stopwatch.Stop();
             idleTracker.Stop();
+            appTracker.Stop();
 
             currentSession.End = DateTime.Now;
 
@@ -58,8 +66,14 @@ namespace ZuriFocus.Monitor
             currentSession.ActiveMinutes = (int)Math.Round(idleTracker.ActiveSeconds / 60.0);
             currentSession.IdleMinutes = (int)Math.Round(idleTracker.IdleSeconds / 60.0);
 
-            // 3) Agregar la sesión al DayLog y guardar
+            // 3) Agregar la sesión al DayLog
             todayLog.Sessions.Add(currentSession);
+
+            // 4) Volcar el uso de aplicaciones al DayLog.Applications
+            List<AppUsage> appUsages = appTracker.GetAppUsageMinutes();
+            MergeApplications(todayLog, appUsages);
+
+            // 5) Guardar el DayLog
             SaveDayLog(todayLog);
 
             Console.WriteLine();
@@ -69,6 +83,12 @@ namespace ZuriFocus.Monitor
             Console.WriteLine($"  Total       : {currentSession.TotalMinutes} min");
             Console.WriteLine($"  Activo      : {currentSession.ActiveMinutes} min");
             Console.WriteLine($"  Idle (aprox): {currentSession.IdleMinutes} min");
+            Console.WriteLine();
+            Console.WriteLine("Uso de aplicaciones en esta ejecución:");
+            foreach (var app in appUsages)
+            {
+                Console.WriteLine($"  {app.ProcessName,-20} -> {app.TotalMinutes} min");
+            }
             Console.WriteLine();
             Console.WriteLine("Log actualizado en la carpeta 'logs'. Presiona ENTER para salir.");
             Console.ReadLine();
@@ -127,6 +147,44 @@ namespace ZuriFocus.Monitor
             string json = JsonSerializer.Serialize(log, options);
             File.WriteAllText(filePath, json);
         }
+
+        private static void MergeApplications(DayLog log, List<AppUsage> newUsages)
+        {
+            foreach (var newApp in newUsages)
+            {
+                if (newApp.TotalMinutes <= 0) continue;
+
+                var existing = log.Applications.Find(a =>
+                    string.Equals(a.ProcessName, newApp.ProcessName, StringComparison.OrdinalIgnoreCase));
+
+                if (existing == null)
+                {
+                    log.Applications.Add(new AppUsage
+                    {
+                        ProcessName = newApp.ProcessName,
+                        TotalMinutes = newApp.TotalMinutes,
+                        FirstUse = newApp.FirstUse,
+                        LastUse = newApp.LastUse
+                    });
+                }
+                else
+                {
+                    existing.TotalMinutes += newApp.TotalMinutes;
+
+                    if (newApp.FirstUse.HasValue)
+                    {
+                        if (!existing.FirstUse.HasValue || newApp.FirstUse < existing.FirstUse)
+                            existing.FirstUse = newApp.FirstUse;
+                    }
+
+                    if (newApp.LastUse.HasValue)
+                    {
+                        if (!existing.LastUse.HasValue || newApp.LastUse > existing.LastUse)
+                            existing.LastUse = newApp.LastUse;
+                    }
+                }
+            }
+        }
     }
 
     // ==================== Modelo de datos ====================
@@ -172,7 +230,7 @@ namespace ZuriFocus.Monitor
     public class IdleTracker
     {
         private readonly int _idleThresholdSeconds;
-        private readonly System.Timers.Timer _timer;
+        private readonly Timer _timer;
 
         private DateTime _lastTickTime;
         private bool _isCurrentlyIdle;
@@ -184,7 +242,7 @@ namespace ZuriFocus.Monitor
         {
             _idleThresholdSeconds = idleThresholdSeconds;
 
-            _timer = new System.Timers.Timer(1000); // cada 1 segundo
+            _timer = new Timer(1000); // cada 1 segundo
             _timer.Elapsed += OnTimerElapsed;
             _timer.AutoReset = true;
         }
@@ -193,7 +251,7 @@ namespace ZuriFocus.Monitor
         {
             _lastTickTime = DateTime.Now;
             _isCurrentlyIdle = false;
-            ActiveSeconds = 0;  
+            ActiveSeconds = 0;
             IdleSeconds = 0;
 
             _timer.Start();
@@ -204,6 +262,11 @@ namespace ZuriFocus.Monitor
             // Contabilizamos el último tramo de tiempo
             UpdateElapsed();
             _timer.Stop();
+        }
+
+        private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
+        {
+            UpdateElapsed();
         }
 
         private void UpdateElapsed()
@@ -227,14 +290,8 @@ namespace ZuriFocus.Monitor
             _lastTickTime = now;
         }
 
-        private void OnTimerElapsed(object? sender, System.Timers.ElapsedEventArgs e)
-        {
-            UpdateElapsed();
-        }
-
         private bool IsIdleNow()
         {
-            // Calcula hace cuánto tiempo fue la última entrada de usuario (mouse/teclado)
             uint idleTimeMs = GetIdleTimeMilliseconds();
             return idleTimeMs >= _idleThresholdSeconds * 1000;
         }
@@ -261,11 +318,134 @@ namespace ZuriFocus.Monitor
                 return 0;
             }
 
-            // dwTime = tick count (ms) de la última entrada
             uint lastInputTick = lastInputInfo.dwTime;
             uint currentTick = (uint)Environment.TickCount;
 
             return currentTick - lastInputTick;
+        }
+    }
+
+    // ==================== Tracker de aplicaciones ====================
+
+    public class AppTracker
+    {
+        private readonly Timer _timer;
+        private DateTime _lastTickTime;
+
+        private readonly Dictionary<string, AppUsageAccumulator> _apps = new();
+
+        public AppTracker()
+        {
+            _timer = new Timer(1000); // cada 1 segundo
+            _timer.Elapsed += OnTimerElapsed;
+            _timer.AutoReset = true;
+        }
+
+        public void Start()
+        {
+            _lastTickTime = DateTime.Now;
+            _apps.Clear();
+            _timer.Start();
+        }
+
+        public void Stop()
+        {
+            UpdateElapsed();
+            _timer.Stop();
+        }
+
+        private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
+        {
+            UpdateElapsed();
+        }
+
+        private void UpdateElapsed()
+        {
+            DateTime now = DateTime.Now;
+            double elapsedSeconds = (now - _lastTickTime).TotalSeconds;
+            if (elapsedSeconds <= 0)
+            {
+                _lastTickTime = now;
+                return;
+            }
+
+            string processName = GetActiveProcessName() ?? "Unknown";
+            int seconds = (int)Math.Round(elapsedSeconds);
+
+            if (!_apps.TryGetValue(processName, out var acc))
+            {
+                acc = new AppUsageAccumulator();
+                _apps[processName] = acc;
+            }
+
+            acc.Seconds += seconds;
+            if (!acc.FirstUse.HasValue)
+                acc.FirstUse = now;
+            acc.LastUse = now;
+
+            _lastTickTime = now;
+        }
+
+        public List<AppUsage> GetAppUsageMinutes()
+        {
+            var result = new List<AppUsage>();
+
+            foreach (var kvp in _apps)
+            {
+                string processName = kvp.Key;
+                var acc = kvp.Value;
+
+                int minutes = (int)Math.Round(acc.Seconds / 60.0);
+                if (minutes <= 0) continue;
+
+                result.Add(new AppUsage
+                {
+                    ProcessName = processName,
+                    TotalMinutes = minutes,
+                    FirstUse = acc.FirstUse,
+                    LastUse = acc.LastUse
+                });
+            }
+
+            return result;
+        }
+
+        // ====== Obtener proceso activo ======
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        private static string? GetActiveProcessName()
+        {
+            try
+            {
+                IntPtr hWnd = GetForegroundWindow();
+                if (hWnd == IntPtr.Zero)
+                    return null;
+
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                if (pid == 0) return null;
+
+                using Process proc = Process.GetProcessById((int)pid);
+                // ProcessName devuelve "chrome", "WINWORD", etc.
+                // Le agregamos ".exe" para que se vea como en el Administrador de tareas
+                return proc.ProcessName + ".exe";
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private class AppUsageAccumulator
+        {
+            public int Seconds;
+            public DateTime? FirstUse;
+            public DateTime? LastUse;
         }
     }
 }
