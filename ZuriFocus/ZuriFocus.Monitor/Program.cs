@@ -14,13 +14,12 @@ namespace ZuriFocus.Monitor
             Console.WriteLine("ZuriFocus Monitor iniciado...");
             Console.WriteLine();
 
-            // 1) Crear el DayLog del día actual con datos reales del equipo
-            DayLog todayLog = new DayLog
-            {
-                Date = DateTime.Today,
-                ComputerId = Environment.MachineName,
-                WindowsUser = Environment.UserName
-            };
+            DateTime today = DateTime.Today;
+            string computerId = Environment.MachineName;
+            string windowsUser = Environment.UserName;
+
+            // 1) Cargar el DayLog del día si existe, o crear uno nuevo
+            DayLog todayLog = LoadDayLogOrCreate(today, computerId, windowsUser);
 
             // 2) Crear una sesión que empieza ahora
             Session currentSession = new Session
@@ -36,23 +35,18 @@ namespace ZuriFocus.Monitor
             Console.WriteLine("Cuando quieras terminar la sesión, presiona ENTER.");
             Console.WriteLine();
 
-            // Usamos un cronómetro para medir la duración de la sesión
             Stopwatch stopwatch = Stopwatch.StartNew();
 
-            // Esperamos a que el usuario presione ENTER
             Console.ReadLine();
 
             stopwatch.Stop();
 
-            // 3) Cerrar sesión: fin = ahora, minutos activos = duración total, idle = 0 (por ahora)
             currentSession.End = DateTime.Now;
             currentSession.ActiveMinutes = (int)Math.Round(stopwatch.Elapsed.TotalMinutes);
-            currentSession.IdleMinutes = 0;
+            currentSession.IdleMinutes = 0; // luego lo calcularemos de verdad
 
-            // Agregamos la sesión al DayLog
+            // 3) Agregar la sesión al DayLog y guardar
             todayLog.Sessions.Add(currentSession);
-
-            // 4) Guardar el DayLog en JSON
             SaveDayLog(todayLog);
 
             Console.WriteLine();
@@ -63,22 +57,58 @@ namespace ZuriFocus.Monitor
             Console.WriteLine($"  Activo : {currentSession.ActiveMinutes} min");
             Console.WriteLine($"  Idle   : {currentSession.IdleMinutes} min (aún sin calcular)");
             Console.WriteLine();
-            Console.WriteLine("Log guardado en la carpeta 'logs'. Presiona ENTER para salir.");
+            Console.WriteLine("Log actualizado en la carpeta 'logs'. Presiona ENTER para salir.");
             Console.ReadLine();
+        }
+
+        private static string GetLogFilePath(DateTime date, string computerId)
+        {
+            string logsFolder = Path.Combine(AppContext.BaseDirectory, "logs");
+            Directory.CreateDirectory(logsFolder);
+
+            string fileName = $"{date:yyyy-MM-dd}-{computerId}.json";
+            return Path.Combine(logsFolder, fileName);
+        }
+
+        private static DayLog LoadDayLogOrCreate(DateTime date, string computerId, string windowsUser)
+        {
+            string filePath = GetLogFilePath(date, computerId);
+
+            if (File.Exists(filePath))
+            {
+                try
+                {
+                    string json = File.ReadAllText(filePath);
+                    var existing = JsonSerializer.Deserialize<DayLog>(json);
+                    if (existing != null)
+                    {
+                        // Por si el usuario de Windows cambió, lo actualizamos
+                        existing.WindowsUser = windowsUser;
+                        return existing;
+                    }
+                }
+                catch
+                {
+                    // Si algo falla al leer/deserializar, creamos uno nuevo limpio
+                }
+            }
+
+            // No hay archivo o no se pudo leer, creamos un DayLog nuevo
+            return new DayLog
+            {
+                Date = date,
+                ComputerId = computerId,
+                WindowsUser = windowsUser
+            };
         }
 
         private static void SaveDayLog(DayLog log)
         {
-            // Carpeta donde se guardarán los logs, al lado del .exe
-            string logsFolder = Path.Combine(AppContext.BaseDirectory, "logs");
-            Directory.CreateDirectory(logsFolder);
-
-            string fileName = $"{log.Date:yyyy-MM-dd}-{log.ComputerId}.json";
-            string filePath = Path.Combine(logsFolder, fileName);
+            string filePath = GetLogFilePath(log.Date, log.ComputerId);
 
             var options = new JsonSerializerOptions
             {
-                WriteIndented = true // para que el JSON se vea bonito
+                WriteIndented = true
             };
 
             string json = JsonSerializer.Serialize(log, options);
