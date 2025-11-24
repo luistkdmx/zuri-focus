@@ -5,6 +5,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Net;
+using System.Net.Mail;
 
 // Alias para evitar conflictos de Timer
 using Timer = System.Timers.Timer;
@@ -24,10 +26,17 @@ namespace ZuriFocus.Monitor
             string computerId = Environment.MachineName;
             string windowsUser = Environment.UserName;
 
-            // 1) Cargar o crear DayLog del día
+
+            // 1) Cargar configuración
+            MonitorSettings settings = LoadSettings();
+
+            // 2) Intentar enviar reporte del último día pendiente
+            MaybeSendDailyReport(settings, computerId);
+
+            // 3) Cargar DayLog de hoy y continuar como ya lo tenías
             DayLog todayLog = LoadDayLogOrCreate(today, computerId, windowsUser);
 
-            // 2) Crear sesión
+            // 4) Crear sesión
             Session currentSession = new Session
             {
                 Start = DateTime.Now
@@ -46,7 +55,7 @@ namespace ZuriFocus.Monitor
 
             Stopwatch stopwatch = Stopwatch.StartNew();
 
-            var idleTracker = new IdleTracker(idleThresholdSeconds: 60);
+            var idleTracker = new IdleTracker(settings.IdleThresholdSeconds);
             var appTracker = new AppTracker();
             var websiteTracker = new WebsiteTracker();
 
@@ -161,6 +170,265 @@ namespace ZuriFocus.Monitor
             string json = JsonSerializer.Serialize(log, options);
             File.WriteAllText(filePath, json);
         }
+
+        private static MonitorSettings LoadSettings()
+        {
+            string filePath = Path.Combine(AppContext.BaseDirectory, "settings.json");
+
+            // Si no existe, creamos uno con valores por defecto
+            if (!File.Exists(filePath))
+            {
+                var defaultSettings = new MonitorSettings();
+                var options = new JsonSerializerOptions { WriteIndented = true };
+                string defaultJson = JsonSerializer.Serialize(defaultSettings, options);
+                File.WriteAllText(filePath, defaultJson);
+
+                Console.WriteLine("No se encontró settings.json. Se creó uno con valores por defecto.");
+                Console.WriteLine($"Umbral de idle: {defaultSettings.IdleThresholdSeconds} segundos");
+                return defaultSettings;
+            }
+
+            try
+            {
+                string json = File.ReadAllText(filePath);
+                var settings = JsonSerializer.Deserialize<MonitorSettings>(json);
+                if (settings == null)
+                    throw new Exception("settings.json deserializado como null.");
+
+                Console.WriteLine($"Configuración cargada. Umbral de idle: {settings.IdleThresholdSeconds} segundos");
+                return settings;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error al leer settings.json. Usando valores por defecto.");
+                Console.WriteLine(ex.Message);
+                return new MonitorSettings();
+            }
+        }
+
+        private static EmailState LoadEmailState()
+        {
+            string filePath = Path.Combine(AppContext.BaseDirectory, "email_state.json");
+
+            if (!File.Exists(filePath))
+            {
+                return new EmailState(); // sin fecha aún
+            }
+
+            try
+            {
+                string json = File.ReadAllText(filePath);
+                var state = JsonSerializer.Deserialize<EmailState>(json);
+                return state ?? new EmailState();
+            }
+            catch
+            {
+                return new EmailState();
+            }
+        }
+
+        private static void SaveEmailState(EmailState state)
+        {
+            string filePath = Path.Combine(AppContext.BaseDirectory, "email_state.json");
+            var options = new JsonSerializerOptions { WriteIndented = true };
+            string json = JsonSerializer.Serialize(state, options);
+            File.WriteAllText(filePath, json);
+        }
+
+        private static DayLog? LoadDayLogFromFile(DateTime date, string computerId)
+        {
+            string filePath = GetLogFilePath(date, computerId);
+            if (!File.Exists(filePath)) return null;
+
+            try
+            {
+                string json = File.ReadAllText(filePath);
+                return JsonSerializer.Deserialize<DayLog>(json);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string BuildHtmlReportBody(DayLog log)
+        {
+            var sb = new System.Text.StringBuilder();
+
+            sb.AppendLine("<html><body>");
+            sb.AppendLine($"<h2>Reporte ZuriFocus - {log.ComputerId} - {log.Date:yyyy-MM-dd}</h2>");
+            sb.AppendLine($"<p><strong>Usuario:</strong> {log.WindowsUser}</p>");
+
+            // Sesiones
+            sb.AppendLine("<h3>Sesiones</h3>");
+            if (log.Sessions == null || log.Sessions.Count == 0)
+            {
+                sb.AppendLine("<p>No hay sesiones registradas.</p>");
+            }
+            else
+            {
+                sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
+                sb.AppendLine("<tr><th>#</th><th>Inicio</th><th>Fin</th><th>Total (min)</th><th>Activo</th><th>Idle</th></tr>");
+
+                int i = 1;
+                foreach (var s in log.Sessions)
+                {
+                    sb.AppendLine("<tr>");
+                    sb.AppendLine($"<td>{i++}</td>");
+                    sb.AppendLine($"<td>{s.Start:HH:mm:ss}</td>");
+                    sb.AppendLine($"<td>{s.End:HH:mm:ss}</td>");
+                    sb.AppendLine($"<td>{s.TotalMinutes}</td>");
+                    sb.AppendLine($"<td>{s.ActiveMinutes}</td>");
+                    sb.AppendLine($"<td>{s.IdleMinutes}</td>");
+                    sb.AppendLine("</tr>");
+                }
+
+                sb.AppendLine("</table>");
+            }
+
+            // Aplicaciones
+            sb.AppendLine("<h3>Aplicaciones (top por tiempo)</h3>");
+            if (log.Applications == null || log.Applications.Count == 0)
+            {
+                sb.AppendLine("<p>No hay aplicaciones registradas.</p>");
+            }
+            else
+            {
+                sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
+                sb.AppendLine("<tr><th>Proceso</th><th>Minutos</th><th>Primera vez</th><th>Última vez</th></tr>");
+
+                foreach (var app in log.Applications
+                             .OrderByDescending(a => a.TotalMinutes))
+                {
+                    sb.AppendLine("<tr>");
+                    sb.AppendLine($"<td>{app.ProcessName}</td>");
+                    sb.AppendLine($"<td>{app.TotalMinutes}</td>");
+                    sb.AppendLine($"<td>{app.FirstUse:HH:mm}</td>");
+                    sb.AppendLine($"<td>{app.LastUse:HH:mm}</td>");
+                    sb.AppendLine("</tr>");
+                }
+
+                sb.AppendLine("</table>");
+            }
+
+            // Sitios web
+            sb.AppendLine("<h3>Sitios web (top por tiempo)</h3>");
+            if (log.Websites == null || log.Websites.Count == 0)
+            {
+                sb.AppendLine("<p>No hay sitios web registrados.</p>");
+            }
+            else
+            {
+                sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
+                sb.AppendLine("<tr><th>Sitio</th><th>Minutos</th><th>Primera vez</th><th>Última vez</th></tr>");
+
+                foreach (var site in log.Websites
+                             .OrderByDescending(w => w.TotalMinutes))
+                {
+                    sb.AppendLine("<tr>");
+                    sb.AppendLine($"<td>{site.Domain}</td>");
+                    sb.AppendLine($"<td>{site.TotalMinutes}</td>");
+                    sb.AppendLine($"<td>{site.FirstUse:HH:mm}</td>");
+                    sb.AppendLine($"<td>{site.LastUse:HH:mm}</td>");
+                    sb.AppendLine("</tr>");
+                }
+
+                sb.AppendLine("</table>");
+            }
+
+            sb.AppendLine("<p style='margin-top:20px;font-size:smaller;color:#666;'>");
+            sb.AppendLine("Reporte generado automáticamente por ZuriFocus.");
+            sb.AppendLine("</p>");
+
+            sb.AppendLine("</body></html>");
+
+            return sb.ToString();
+        }
+
+        private static void SendEmailReport(DayLog log, EmailSettings emailSettings)
+        {
+            if (emailSettings.Recipients == null || emailSettings.Recipients.Count == 0)
+            {
+                Console.WriteLine("Email.Enabled=true pero no hay destinatarios configurados.");
+                return;
+            }
+
+            string subject = $"Reporte ZuriFocus - {log.ComputerId} - {log.Date:yyyy-MM-dd}";
+            string bodyHtml = BuildHtmlReportBody(log);
+
+            try
+            {
+                using var message = new MailMessage();
+                message.From = new MailAddress(emailSettings.FromAddress, emailSettings.FromName);
+
+                foreach (var to in emailSettings.Recipients)
+                {
+                    if (!string.IsNullOrWhiteSpace(to))
+                        message.To.Add(to);
+                }
+
+                message.Subject = subject;
+                message.Body = bodyHtml;
+                message.IsBodyHtml = true;
+
+                using var client = new SmtpClient(emailSettings.SmtpHost, emailSettings.SmtpPort);
+                client.EnableSsl = emailSettings.UseSsl;
+                client.Credentials = new NetworkCredential(emailSettings.Username, emailSettings.Password);
+
+                client.Send(message);
+                Console.WriteLine($"Correo de reporte enviado para el día {log.Date:yyyy-MM-dd}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error al enviar el correo de reporte:");
+                Console.WriteLine(ex.Message);
+            }
+        }
+
+        private static void MaybeSendDailyReport(MonitorSettings settings, string computerId)
+        {
+            if (settings.Email == null || !settings.Email.Enabled)
+            {
+                return;
+            }
+
+            EmailState state = LoadEmailState();
+            DateTime today = DateTime.Today;
+            DateTime? lastSent = state.LastReportSentDate;
+
+            // empezamos por el día anterior
+            DateTime candidate = today.AddDays(-1);
+            DateTime minDate = today.AddDays(-7); // límite para no irnos demasiado atrás
+
+            DateTime? dateToSend = null;
+
+            while (candidate >= minDate)
+            {
+                // si ya enviamos este o uno posterior, paramos
+                if (lastSent.HasValue && candidate <= lastSent.Value)
+                    break;
+
+                var log = LoadDayLogFromFile(candidate, computerId);
+                if (log != null && log.Sessions != null && log.Sessions.Count > 0)
+                {
+                    dateToSend = candidate;
+                    // enviamos este log y salimos
+                    SendEmailReport(log, settings.Email);
+                    state.LastReportSentDate = candidate;
+                    SaveEmailState(state);
+                    break;
+                }
+
+                candidate = candidate.AddDays(-1);
+            }
+
+            if (dateToSend == null)
+            {
+                Console.WriteLine("No se encontró ningún día pendiente con logs para enviar por correo.");
+            }
+        }
+
+
 
         private static void MergeApplications(DayLog log, List<AppUsage> newUsages)
         {
@@ -667,4 +935,32 @@ namespace ZuriFocus.Monitor
             public DateTime? LastUse;
         }
     }
+    // ==================== Configuración ====================
+
+    public class MonitorSettings
+    {
+        public int IdleThresholdSeconds { get; set; } = 60;
+
+        public EmailSettings Email { get; set; } = new EmailSettings();
+    }
+
+    public class EmailSettings
+    {
+        public bool Enabled { get; set; } = false;
+        public string SmtpHost { get; set; } = "";
+        public int SmtpPort { get; set; } = 587;
+        public bool UseSsl { get; set; } = true;
+        public string FromAddress { get; set; } = "";
+        public string FromName { get; set; } = "ZuriFocus";
+        public string Username { get; set; } = "";
+        public string Password { get; set; } = "";
+        public List<string> Recipients { get; set; } = new();
+    }
+
+    public class EmailState
+    {
+        public DateTime? LastReportSentDate { get; set; }
+    }
+
+
 }
