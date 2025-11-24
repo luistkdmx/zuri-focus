@@ -172,7 +172,7 @@ namespace ZuriFocus.Monitor
     public class IdleTracker
     {
         private readonly int _idleThresholdSeconds;
-        private readonly Timer _timer;
+        private readonly System.Timers.Timer _timer;
 
         private DateTime _lastTickTime;
         private bool _isCurrentlyIdle;
@@ -184,7 +184,7 @@ namespace ZuriFocus.Monitor
         {
             _idleThresholdSeconds = idleThresholdSeconds;
 
-            _timer = new Timer(1000); // cada 1 segundo
+            _timer = new System.Timers.Timer(1000); // cada 1 segundo
             _timer.Elapsed += OnTimerElapsed;
             _timer.AutoReset = true;
         }
@@ -193,7 +193,7 @@ namespace ZuriFocus.Monitor
         {
             _lastTickTime = DateTime.Now;
             _isCurrentlyIdle = false;
-            ActiveSeconds = 0;
+            ActiveSeconds = 0;  
             IdleSeconds = 0;
 
             _timer.Start();
@@ -201,12 +201,12 @@ namespace ZuriFocus.Monitor
 
         public void Stop()
         {
-            // Hacemos un último tick para contabilizar el tiempo hasta ahora
-            OnTimerElapsed(null, null);
+            // Contabilizamos el último tramo de tiempo
+            UpdateElapsed();
             _timer.Stop();
         }
 
-        private void OnTimerElapsed(object sender, ElapsedEventArgs e)
+        private void UpdateElapsed()
         {
             DateTime now = DateTime.Now;
             double elapsedSeconds = (now - _lastTickTime).TotalSeconds;
@@ -214,7 +214,6 @@ namespace ZuriFocus.Monitor
 
             bool isIdleNow = IsIdleNow();
 
-            // Sumamos el tiempo transcurrido al estado anterior
             if (_isCurrentlyIdle)
             {
                 IdleSeconds += (int)Math.Round(elapsedSeconds);
@@ -224,9 +223,13 @@ namespace ZuriFocus.Monitor
                 ActiveSeconds += (int)Math.Round(elapsedSeconds);
             }
 
-            // Actualizamos estado para el siguiente ciclo
             _isCurrentlyIdle = isIdleNow;
             _lastTickTime = now;
+        }
+
+        private void OnTimerElapsed(object? sender, System.Timers.ElapsedEventArgs e)
+        {
+            UpdateElapsed();
         }
 
         private bool IsIdleNow()
