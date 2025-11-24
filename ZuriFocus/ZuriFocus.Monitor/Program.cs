@@ -2,7 +2,9 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Timers;
 
 namespace ZuriFocus.Monitor
 {
@@ -10,7 +12,7 @@ namespace ZuriFocus.Monitor
     {
         static void Main(string[] args)
         {
-            Console.Title = "ZuriFocus Monitor - Sesión simple";
+            Console.Title = "ZuriFocus Monitor - Sesión con activo/idle";
             Console.WriteLine("ZuriFocus Monitor iniciado...");
             Console.WriteLine();
 
@@ -32,18 +34,29 @@ namespace ZuriFocus.Monitor
             Console.WriteLine($"Inicio de sesión: {currentSession.Start:yyyy-MM-dd HH:mm:ss}");
             Console.WriteLine();
             Console.WriteLine("Monitoreando sesión actual...");
+            Console.WriteLine("Regla: si pasan 60 segundos sin mover mouse/teclado, se cuenta como 'idle'.");
             Console.WriteLine("Cuando quieras terminar la sesión, presiona ENTER.");
             Console.WriteLine();
 
+            // Cronómetro de duración total de la sesión
             Stopwatch stopwatch = Stopwatch.StartNew();
 
+            // Tracker de actividad / idle
+            IdleTracker idleTracker = new IdleTracker(idleThresholdSeconds: 60);
+            idleTracker.Start();
+
+            // Esperamos a que el usuario presione ENTER para terminar la sesión
             Console.ReadLine();
 
+            // Paramos todo
             stopwatch.Stop();
+            idleTracker.Stop();
 
             currentSession.End = DateTime.Now;
-            currentSession.ActiveMinutes = (int)Math.Round(stopwatch.Elapsed.TotalMinutes);
-            currentSession.IdleMinutes = 0; // luego lo calcularemos de verdad
+
+            // Convertimos segundos activos/idle a minutos
+            currentSession.ActiveMinutes = (int)Math.Round(idleTracker.ActiveSeconds / 60.0);
+            currentSession.IdleMinutes = (int)Math.Round(idleTracker.IdleSeconds / 60.0);
 
             // 3) Agregar la sesión al DayLog y guardar
             todayLog.Sessions.Add(currentSession);
@@ -51,15 +64,17 @@ namespace ZuriFocus.Monitor
 
             Console.WriteLine();
             Console.WriteLine("Sesión registrada:");
-            Console.WriteLine($"  Inicio : {currentSession.Start:HH:mm:ss}");
-            Console.WriteLine($"  Fin    : {currentSession.End:HH:mm:ss}");
-            Console.WriteLine($"  Total  : {currentSession.TotalMinutes} min");
-            Console.WriteLine($"  Activo : {currentSession.ActiveMinutes} min");
-            Console.WriteLine($"  Idle   : {currentSession.IdleMinutes} min (aún sin calcular)");
+            Console.WriteLine($"  Inicio      : {currentSession.Start:HH:mm:ss}");
+            Console.WriteLine($"  Fin         : {currentSession.End:HH:mm:ss}");
+            Console.WriteLine($"  Total       : {currentSession.TotalMinutes} min");
+            Console.WriteLine($"  Activo      : {currentSession.ActiveMinutes} min");
+            Console.WriteLine($"  Idle (aprox): {currentSession.IdleMinutes} min");
             Console.WriteLine();
             Console.WriteLine("Log actualizado en la carpeta 'logs'. Presiona ENTER para salir.");
             Console.ReadLine();
         }
+
+        // ==================== Manejo de DayLog ====================
 
         private static string GetLogFilePath(DateTime date, string computerId)
         {
@@ -82,7 +97,6 @@ namespace ZuriFocus.Monitor
                     var existing = JsonSerializer.Deserialize<DayLog>(json);
                     if (existing != null)
                     {
-                        // Por si el usuario de Windows cambió, lo actualizamos
                         existing.WindowsUser = windowsUser;
                         return existing;
                     }
@@ -93,7 +107,6 @@ namespace ZuriFocus.Monitor
                 }
             }
 
-            // No hay archivo o no se pudo leer, creamos un DayLog nuevo
             return new DayLog
             {
                 Date = date,
@@ -116,7 +129,7 @@ namespace ZuriFocus.Monitor
         }
     }
 
-    // ======== CLASES DEL MODELO DE DATOS ========
+    // ==================== Modelo de datos ====================
 
     public class DayLog
     {
@@ -152,5 +165,104 @@ namespace ZuriFocus.Monitor
         public int TotalMinutes { get; set; }
         public DateTime? FirstUse { get; set; }
         public DateTime? LastUse { get; set; }
+    }
+
+    // ==================== Tracker de actividad / idle ====================
+
+    public class IdleTracker
+    {
+        private readonly int _idleThresholdSeconds;
+        private readonly Timer _timer;
+
+        private DateTime _lastTickTime;
+        private bool _isCurrentlyIdle;
+
+        public int ActiveSeconds { get; private set; }
+        public int IdleSeconds { get; private set; }
+
+        public IdleTracker(int idleThresholdSeconds)
+        {
+            _idleThresholdSeconds = idleThresholdSeconds;
+
+            _timer = new Timer(1000); // cada 1 segundo
+            _timer.Elapsed += OnTimerElapsed;
+            _timer.AutoReset = true;
+        }
+
+        public void Start()
+        {
+            _lastTickTime = DateTime.Now;
+            _isCurrentlyIdle = false;
+            ActiveSeconds = 0;
+            IdleSeconds = 0;
+
+            _timer.Start();
+        }
+
+        public void Stop()
+        {
+            // Hacemos un último tick para contabilizar el tiempo hasta ahora
+            OnTimerElapsed(null, null);
+            _timer.Stop();
+        }
+
+        private void OnTimerElapsed(object sender, ElapsedEventArgs e)
+        {
+            DateTime now = DateTime.Now;
+            double elapsedSeconds = (now - _lastTickTime).TotalSeconds;
+            if (elapsedSeconds < 0) elapsedSeconds = 0;
+
+            bool isIdleNow = IsIdleNow();
+
+            // Sumamos el tiempo transcurrido al estado anterior
+            if (_isCurrentlyIdle)
+            {
+                IdleSeconds += (int)Math.Round(elapsedSeconds);
+            }
+            else
+            {
+                ActiveSeconds += (int)Math.Round(elapsedSeconds);
+            }
+
+            // Actualizamos estado para el siguiente ciclo
+            _isCurrentlyIdle = isIdleNow;
+            _lastTickTime = now;
+        }
+
+        private bool IsIdleNow()
+        {
+            // Calcula hace cuánto tiempo fue la última entrada de usuario (mouse/teclado)
+            uint idleTimeMs = GetIdleTimeMilliseconds();
+            return idleTimeMs >= _idleThresholdSeconds * 1000;
+        }
+
+        // ====== Interop con Windows: GetLastInputInfo ======
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LASTINPUTINFO
+        {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        private static uint GetIdleTimeMilliseconds()
+        {
+            LASTINPUTINFO lastInputInfo = new LASTINPUTINFO();
+            lastInputInfo.cbSize = (uint)Marshal.SizeOf(lastInputInfo);
+
+            if (!GetLastInputInfo(ref lastInputInfo))
+            {
+                return 0;
+            }
+
+            // dwTime = tick count (ms) de la última entrada
+            uint lastInputTick = lastInputInfo.dwTime;
+            uint currentTick = (uint)Environment.TickCount;
+
+            return currentTick - lastInputTick;
+        }
     }
 }
