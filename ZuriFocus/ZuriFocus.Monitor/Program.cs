@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
 
@@ -9,18 +10,60 @@ namespace ZuriFocus.Monitor
     {
         static void Main(string[] args)
         {
-            Console.Title = "ZuriFocus Monitor - Versión de prueba";
+            Console.Title = "ZuriFocus Monitor - Sesión simple";
             Console.WriteLine("ZuriFocus Monitor iniciado...");
             Console.WriteLine();
 
-            // Crear un log de ejemplo para probar la estructura
-            DayLog todayLog = DayLog.CreateExample();
+            // 1) Crear el DayLog del día actual con datos reales del equipo
+            DayLog todayLog = new DayLog
+            {
+                Date = DateTime.Today,
+                ComputerId = Environment.MachineName,
+                WindowsUser = Environment.UserName
+            };
 
-            // Guardar el log en un archivo JSON
+            // 2) Crear una sesión que empieza ahora
+            Session currentSession = new Session
+            {
+                Start = DateTime.Now
+            };
+
+            Console.WriteLine($"Equipo: {todayLog.ComputerId}");
+            Console.WriteLine($"Usuario Windows: {todayLog.WindowsUser}");
+            Console.WriteLine($"Inicio de sesión: {currentSession.Start:yyyy-MM-dd HH:mm:ss}");
+            Console.WriteLine();
+            Console.WriteLine("Monitoreando sesión actual...");
+            Console.WriteLine("Cuando quieras terminar la sesión, presiona ENTER.");
+            Console.WriteLine();
+
+            // Usamos un cronómetro para medir la duración de la sesión
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            // Esperamos a que el usuario presione ENTER
+            Console.ReadLine();
+
+            stopwatch.Stop();
+
+            // 3) Cerrar sesión: fin = ahora, minutos activos = duración total, idle = 0 (por ahora)
+            currentSession.End = DateTime.Now;
+            currentSession.ActiveMinutes = (int)Math.Round(stopwatch.Elapsed.TotalMinutes);
+            currentSession.IdleMinutes = 0;
+
+            // Agregamos la sesión al DayLog
+            todayLog.Sessions.Add(currentSession);
+
+            // 4) Guardar el DayLog en JSON
             SaveDayLog(todayLog);
 
-            Console.WriteLine("Log de ejemplo guardado en la carpeta 'logs'.");
-            Console.WriteLine("Presiona ENTER para salir.");
+            Console.WriteLine();
+            Console.WriteLine("Sesión registrada:");
+            Console.WriteLine($"  Inicio : {currentSession.Start:HH:mm:ss}");
+            Console.WriteLine($"  Fin    : {currentSession.End:HH:mm:ss}");
+            Console.WriteLine($"  Total  : {currentSession.TotalMinutes} min");
+            Console.WriteLine($"  Activo : {currentSession.ActiveMinutes} min");
+            Console.WriteLine($"  Idle   : {currentSession.IdleMinutes} min (aún sin calcular)");
+            Console.WriteLine();
+            Console.WriteLine("Log guardado en la carpeta 'logs'. Presiona ENTER para salir.");
             Console.ReadLine();
         }
 
@@ -53,62 +96,6 @@ namespace ZuriFocus.Monitor
         public List<Session> Sessions { get; set; } = new();
         public List<AppUsage> Applications { get; set; } = new();
         public List<WebsiteUsage> Websites { get; set; } = new();
-
-        // Método estático para generar un ejemplo de prueba
-        public static DayLog CreateExample()
-        {
-            var log = new DayLog
-            {
-                Date = DateTime.Today,
-                ComputerId = "EQUIPO_01",
-                WindowsUser = Environment.UserName
-            };
-
-            // Sesión de ejemplo
-            log.Sessions.Add(new Session
-            {
-                Start = DateTime.Today.AddHours(8.5),   // 08:30
-                End = DateTime.Today.AddHours(13),      // 13:00
-                ActiveMinutes = 220,
-                IdleMinutes = 50
-            });
-
-            // Uso de aplicaciones de ejemplo
-            log.Applications.Add(new AppUsage
-            {
-                ProcessName = "chrome.exe",
-                TotalMinutes = 180,
-                FirstUse = DateTime.Today.AddHours(9),
-                LastUse = DateTime.Today.AddHours(12)
-            });
-
-            log.Applications.Add(new AppUsage
-            {
-                ProcessName = "excel.exe",
-                TotalMinutes = 45,
-                FirstUse = DateTime.Today.AddHours(10.5),
-                LastUse = DateTime.Today.AddHours(11.25)
-            });
-
-            // Uso de sitios web de ejemplo
-            log.Websites.Add(new WebsiteUsage
-            {
-                Domain = "chatgpt.com",
-                TotalMinutes = 48,
-                FirstUse = DateTime.Today.AddHours(9.25),
-                LastUse = DateTime.Today.AddHours(11.0)
-            });
-
-            log.Websites.Add(new WebsiteUsage
-            {
-                Domain = "youtube.com",
-                TotalMinutes = 30,
-                FirstUse = DateTime.Today.AddHours(12),
-                LastUse = DateTime.Today.AddHours(13)
-            });
-
-            return log;
-        }
     }
 
     public class Session
