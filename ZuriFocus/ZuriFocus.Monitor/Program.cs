@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 
 // Alias para evitar conflictos de Timer
@@ -15,7 +16,7 @@ namespace ZuriFocus.Monitor
     {
         static void Main(string[] args)
         {
-            Console.Title = "ZuriFocus Monitor - Sesión con activo/idle y apps";
+            Console.Title = "ZuriFocus Monitor - Sesión con activo/idle, apps y sitios";
             Console.WriteLine("ZuriFocus Monitor iniciado...");
             Console.WriteLine();
 
@@ -23,59 +24,63 @@ namespace ZuriFocus.Monitor
             string computerId = Environment.MachineName;
             string windowsUser = Environment.UserName;
 
-            // 1) Cargar el DayLog del día si existe, o crear uno nuevo
+            // 1) Cargar o crear DayLog del día
             DayLog todayLog = LoadDayLogOrCreate(today, computerId, windowsUser);
 
-            // 2) Crear una sesión que empieza ahora
+            // 2) Crear sesión
             Session currentSession = new Session
             {
                 Start = DateTime.Now
             };
 
-            Console.WriteLine($"Equipo: {todayLog.ComputerId}");
-            Console.WriteLine($"Usuario Windows: {todayLog.WindowsUser}");
-            Console.WriteLine($"Inicio de sesión: {currentSession.Start:yyyy-MM-dd HH:mm:ss}");
+            Console.WriteLine($"Equipo : {todayLog.ComputerId}");
+            Console.WriteLine($"Usuario: {todayLog.WindowsUser}");
+            Console.WriteLine($"Inicio : {currentSession.Start:yyyy-MM-dd HH:mm:ss}");
             Console.WriteLine();
             Console.WriteLine("Monitoreando sesión actual...");
-            Console.WriteLine(" - Idle: si pasan 60 segundos sin mover mouse/teclado, se cuenta como inactivo.");
-            Console.WriteLine(" - Apps: se mide qué proceso está en primer plano (chrome, excel, etc.).");
+            Console.WriteLine(" - Idle : si pasan 60 s sin mover mouse/teclado -> inactivo.");
+            Console.WriteLine(" - Apps : se mide qué proceso está en primer plano.");
+            Console.WriteLine(" - Web  : se mide sitio activo usando el título de la pestaña.");
             Console.WriteLine("Cuando quieras terminar la sesión, presiona ENTER.");
             Console.WriteLine();
 
-            // Cronómetro de duración total de la sesión
             Stopwatch stopwatch = Stopwatch.StartNew();
 
-            // Trackers de actividad / idle y aplicaciones
-            IdleTracker idleTracker = new IdleTracker(idleThresholdSeconds: 60);
-            AppTracker appTracker = new AppTracker();
+            var idleTracker = new IdleTracker(idleThresholdSeconds: 60);
+            var appTracker = new AppTracker();
+            var websiteTracker = new WebsiteTracker();
 
             idleTracker.Start();
             appTracker.Start();
+            websiteTracker.Start();
 
-            // Esperamos a que el usuario presione ENTER para terminar la sesión
-            Console.ReadLine();
+            Console.ReadLine(); // Esperamos fin de la sesión
 
-            // Paramos todo
+            // Parar trackers
             stopwatch.Stop();
             idleTracker.Stop();
             appTracker.Stop();
+            websiteTracker.Stop();
 
             currentSession.End = DateTime.Now;
-
-            // Convertimos segundos activos/idle a minutos
             currentSession.ActiveMinutes = (int)Math.Round(idleTracker.ActiveSeconds / 60.0);
             currentSession.IdleMinutes = (int)Math.Round(idleTracker.IdleSeconds / 60.0);
 
-            // 3) Agregar la sesión al DayLog
+            // 3) Agregar sesión al DayLog
             todayLog.Sessions.Add(currentSession);
 
-            // 4) Volcar el uso de aplicaciones al DayLog.Applications
+            // 4) Aplicaciones
             List<AppUsage> appUsages = appTracker.GetAppUsageMinutes();
             MergeApplications(todayLog, appUsages);
 
-            // 5) Guardar el DayLog
+            // 5) Sitios web
+            List<WebsiteUsage> websiteUsages = websiteTracker.GetWebsiteUsageMinutes();
+            MergeWebsites(todayLog, websiteUsages);
+
+            // 6) Guardar
             SaveDayLog(todayLog);
 
+            // --- Resumen en consola ---
             Console.WriteLine();
             Console.WriteLine("Sesión registrada:");
             Console.WriteLine($"  Inicio      : {currentSession.Start:HH:mm:ss}");
@@ -84,11 +89,20 @@ namespace ZuriFocus.Monitor
             Console.WriteLine($"  Activo      : {currentSession.ActiveMinutes} min");
             Console.WriteLine($"  Idle (aprox): {currentSession.IdleMinutes} min");
             Console.WriteLine();
+
             Console.WriteLine("Uso de aplicaciones en esta ejecución:");
             foreach (var app in appUsages)
             {
                 Console.WriteLine($"  {app.ProcessName,-20} -> {app.TotalMinutes} min");
             }
+            Console.WriteLine();
+
+            Console.WriteLine("Sitios web en esta ejecución:");
+            foreach (var site in websiteUsages)
+            {
+                Console.WriteLine($"  {site.Domain,-30} -> {site.TotalMinutes} min");
+            }
+
             Console.WriteLine();
             Console.WriteLine("Log actualizado en la carpeta 'logs'. Presiona ENTER para salir.");
             Console.ReadLine();
@@ -123,7 +137,7 @@ namespace ZuriFocus.Monitor
                 }
                 catch
                 {
-                    // Si algo falla al leer/deserializar, creamos uno nuevo limpio
+                    // si falla, creamos uno nuevo
                 }
             }
 
@@ -185,6 +199,45 @@ namespace ZuriFocus.Monitor
                 }
             }
         }
+
+        private static void MergeWebsites(DayLog log, List<WebsiteUsage> newUsages)
+        {
+            foreach (var newSite in newUsages)
+            {
+                if (newSite.TotalMinutes <= 0) continue;
+                if (string.IsNullOrWhiteSpace(newSite.Domain)) continue;
+
+                var existing = log.Websites.Find(w =>
+                    string.Equals(w.Domain, newSite.Domain, StringComparison.OrdinalIgnoreCase));
+
+                if (existing == null)
+                {
+                    log.Websites.Add(new WebsiteUsage
+                    {
+                        Domain = newSite.Domain,
+                        TotalMinutes = newSite.TotalMinutes,
+                        FirstUse = newSite.FirstUse,
+                        LastUse = newSite.LastUse
+                    });
+                }
+                else
+                {
+                    existing.TotalMinutes += newSite.TotalMinutes;
+
+                    if (newSite.FirstUse.HasValue)
+                    {
+                        if (!existing.FirstUse.HasValue || newSite.FirstUse < existing.FirstUse)
+                            existing.FirstUse = newSite.FirstUse;
+                    }
+
+                    if (newSite.LastUse.HasValue)
+                    {
+                        if (!existing.LastUse.HasValue || newSite.LastUse > existing.LastUse)
+                            existing.LastUse = newSite.LastUse;
+                    }
+                }
+            }
+        }
     }
 
     // ==================== Modelo de datos ====================
@@ -225,7 +278,7 @@ namespace ZuriFocus.Monitor
         public DateTime? LastUse { get; set; }
     }
 
-    // ==================== Tracker de actividad / idle ====================
+    // ==================== IdleTracker ====================
 
     public class IdleTracker
     {
@@ -259,7 +312,6 @@ namespace ZuriFocus.Monitor
 
         public void Stop()
         {
-            // Contabilizamos el último tramo de tiempo
             UpdateElapsed();
             _timer.Stop();
         }
@@ -296,8 +348,6 @@ namespace ZuriFocus.Monitor
             return idleTimeMs >= _idleThresholdSeconds * 1000;
         }
 
-        // ====== Interop con Windows: GetLastInputInfo ======
-
         [StructLayout(LayoutKind.Sequential)]
         private struct LASTINPUTINFO
         {
@@ -325,7 +375,7 @@ namespace ZuriFocus.Monitor
         }
     }
 
-    // ==================== Tracker de aplicaciones ====================
+    // ==================== AppTracker ====================
 
     public class AppTracker
     {
@@ -410,8 +460,6 @@ namespace ZuriFocus.Monitor
             return result;
         }
 
-        // ====== Obtener proceso activo ======
-
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
@@ -431,8 +479,6 @@ namespace ZuriFocus.Monitor
                 if (pid == 0) return null;
 
                 using Process proc = Process.GetProcessById((int)pid);
-                // ProcessName devuelve "chrome", "WINWORD", etc.
-                // Le agregamos ".exe" para que se vea como en el Administrador de tareas
                 return proc.ProcessName + ".exe";
             }
             catch
@@ -442,6 +488,179 @@ namespace ZuriFocus.Monitor
         }
 
         private class AppUsageAccumulator
+        {
+            public int Seconds;
+            public DateTime? FirstUse;
+            public DateTime? LastUse;
+        }
+    }
+
+    // ==================== WebsiteTracker ====================
+
+    public class WebsiteTracker
+    {
+        private readonly Timer _timer;
+        private DateTime _lastTickTime;
+
+        private readonly Dictionary<string, WebsiteUsageAccumulator> _sites = new();
+
+        // lista básica de procesos de navegador que queremos considerar
+        private static readonly string[] BrowserProcesses = new[]
+        {
+            "chrome.exe",
+            "msedge.exe",
+            "firefox.exe",
+            "opera.exe",
+            "brave.exe"
+        };
+
+        public WebsiteTracker()
+        {
+            _timer = new Timer(1000); // cada 1 segundo
+            _timer.Elapsed += OnTimerElapsed;
+            _timer.AutoReset = true;
+        }
+
+        public void Start()
+        {
+            _lastTickTime = DateTime.Now;
+            _sites.Clear();
+            _timer.Start();
+        }
+
+        public void Stop()
+        {
+            UpdateElapsed();
+            _timer.Stop();
+        }
+
+        private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
+        {
+            UpdateElapsed();
+        }
+
+        private void UpdateElapsed()
+        {
+            DateTime now = DateTime.Now;
+            double elapsedSeconds = (now - _lastTickTime).TotalSeconds;
+            if (elapsedSeconds <= 0)
+            {
+                _lastTickTime = now;
+                return;
+            }
+
+            var info = GetActiveBrowserAndSite();
+            if (info != null)
+            {
+                string label = info.Value.SiteLabel;
+                int seconds = (int)Math.Round(elapsedSeconds);
+
+                if (!_sites.TryGetValue(label, out var acc))
+                {
+                    acc = new WebsiteUsageAccumulator();
+                    _sites[label] = acc;
+                }
+
+                acc.Seconds += seconds;
+                if (!acc.FirstUse.HasValue)
+                    acc.FirstUse = now;
+                acc.LastUse = now;
+            }
+
+            _lastTickTime = now;
+        }
+
+        public List<WebsiteUsage> GetWebsiteUsageMinutes()
+        {
+            var result = new List<WebsiteUsage>();
+
+            foreach (var kvp in _sites)
+            {
+                string label = kvp.Key;
+                var acc = kvp.Value;
+
+                int minutes = (int)Math.Round(acc.Seconds / 60.0);
+                if (minutes <= 0) continue;
+
+                result.Add(new WebsiteUsage
+                {
+                    Domain = label, // aquí usamos el "label" (título recortado) como nombre del sitio
+                    TotalMinutes = minutes,
+                    FirstUse = acc.FirstUse,
+                    LastUse = acc.LastUse
+                });
+            }
+
+            return result;
+        }
+
+        // ------- helpers: ventana activa, título, etc. -------
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+        private static (string ProcessName, string SiteLabel)? GetActiveBrowserAndSite()
+        {
+            try
+            {
+                IntPtr hWnd = GetForegroundWindow();
+                if (hWnd == IntPtr.Zero)
+                    return null;
+
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                if (pid == 0) return null;
+
+                using Process proc = Process.GetProcessById((int)pid);
+                string processName = proc.ProcessName.ToLowerInvariant() + ".exe";
+
+                // si no es un navegador, no contamos
+                bool isBrowser = false;
+                foreach (var b in BrowserProcesses)
+                {
+                    if (string.Equals(processName, b, StringComparison.OrdinalIgnoreCase))
+                    {
+                        isBrowser = true;
+                        break;
+                    }
+                }
+                if (!isBrowser) return null;
+
+                // leemos el título de la ventana
+                StringBuilder sb = new StringBuilder(512);
+                int length = GetWindowText(hWnd, sb, sb.Capacity);
+                if (length <= 0) return null;
+
+                string title = sb.ToString().Trim();
+                if (string.IsNullOrWhiteSpace(title)) return null;
+
+                // muchos navegadores ponen "Página - Google Chrome" o similar
+                // nos quedamos con la parte antes del último " - "
+                int dashIndex = title.LastIndexOf(" - ");
+                if (dashIndex > 0)
+                {
+                    title = title.Substring(0, dashIndex).Trim();
+                }
+
+                // si quedó muy largo, recortamos un poco para el reporte
+                if (title.Length > 60)
+                    title = title.Substring(0, 60) + "...";
+
+                return (processName, title);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private class WebsiteUsageAccumulator
         {
             public int Seconds;
             public DateTime? FirstUse;

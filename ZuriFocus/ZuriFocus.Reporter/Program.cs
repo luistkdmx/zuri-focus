@@ -120,6 +120,7 @@ namespace ZuriFocus.Reporter
 
             PrintSessions(log);
             PrintApplications(log);
+            PrintWebsites(log);
         }
 
         private static void PrintSessions(DayLog log)
@@ -169,6 +170,35 @@ namespace ZuriFocus.Reporter
 
             Console.WriteLine();
         }
+
+       
+
+        private static void PrintWebsites(DayLog log)
+        {
+            Console.WriteLine("== Sitios web (ordenados por tiempo) ==");
+
+            if (log.Websites == null || log.Websites.Count == 0)
+            {
+                Console.WriteLine("No hay sitios web registrados.");
+                Console.WriteLine();
+                return;
+            }
+
+            var orderedSites = log.Websites
+                .OrderByDescending(w => w.TotalMinutes)
+                .ToList();
+
+            foreach (var site in orderedSites)
+            {
+                Console.WriteLine(
+                    $"{site.Domain,-30}  {site.TotalMinutes,4} min   " +
+                    $"({site.FirstUse:HH:mm} - {site.LastUse:HH:mm})");
+            }
+
+            Console.WriteLine();
+        }
+        
+
     }
 
     // --------- Modelos (deben coincidir con el JSON del Monitor) ---------
