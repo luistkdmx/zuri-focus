@@ -31,7 +31,7 @@ namespace ZuriFocus.Monitor
             MonitorSettings settings = LoadSettings();
 
             // 2) Intentar enviar reporte del último día pendiente
-            MaybeSendDailyReport(settings, computerId);
+            MaybeSendWeeklyReport(settings, computerId);
 
             // 3) Cargar DayLog de hoy y continuar como ya lo tenías
             DayLog todayLog = LoadDayLogOrCreate(today, computerId, windowsUser);
@@ -251,93 +251,124 @@ namespace ZuriFocus.Monitor
             }
         }
 
-        private static string BuildHtmlReportBody(DayLog log)
+        private static string BuildHtmlReportBody(WeeklyReportData weekly)
         {
             var sb = new System.Text.StringBuilder();
 
             sb.AppendLine("<html><body>");
-            sb.AppendLine($"<h2>Reporte ZuriFocus - {log.ComputerId} - {log.Date:yyyy-MM-dd}</h2>");
-            sb.AppendLine($"<p><strong>Usuario:</strong> {log.WindowsUser}</p>");
+            sb.AppendLine($"<h2>Reporte semanal ZuriFocus - {weekly.ComputerId}</h2>");
+            sb.AppendLine($"<p><strong>Semana:</strong> {weekly.WeekStart:yyyy-MM-dd} al {weekly.WeekEnd:yyyy-MM-dd}</p>");
 
-            // Sesiones
-            sb.AppendLine("<h3>Sesiones</h3>");
-            if (log.Sessions == null || log.Sessions.Count == 0)
+            if (!string.IsNullOrWhiteSpace(weekly.WindowsUser))
             {
-                sb.AppendLine("<p>No hay sesiones registradas.</p>");
+                sb.AppendLine($"<p><strong>Usuario principal:</strong> {weekly.WindowsUser}</p>");
+            }
+
+            sb.AppendLine("<h3>Sesiones agregadas por día (lunes a domingo)</h3>");
+            sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
+            sb.AppendLine("<tr><th>#</th><th>Día</th><th>Encendido (h)</th><th>Activo (h)</th><th>Idle (h)</th></tr>");
+
+            double totalOnHours = 0;
+            double totalActiveHours = 0;
+            double totalIdleHours = 0;
+
+            for (int i = 0; i < weekly.Days.Count; i++)
+            {
+                var d = weekly.Days[i];
+
+                double onH = d.TotalOnMinutes / 60.0;
+                double actH = d.ActiveMinutes / 60.0;
+                double idleH = d.IdleMinutes / 60.0;
+
+                totalOnHours += onH;
+                totalActiveHours += actH;
+                totalIdleHours += idleH;
+
+                string dayName = GetSpanishDayName(d.Date.DayOfWeek);
+
+                sb.AppendLine("<tr>");
+                sb.AppendLine($"<td>{i + 1}</td>");
+                sb.AppendLine($"<td>{dayName} {d.Date:dd/MM}</td>");
+                sb.AppendLine($"<td>{onH:F2}</td>");
+                sb.AppendLine($"<td>{actH:F2}</td>");
+                sb.AppendLine($"<td>{idleH:F2}</td>");
+                sb.AppendLine("</tr>");
+            }
+
+            // Fila de totales
+            sb.AppendLine("<tr>");
+            sb.AppendLine("<td colspan='2'><strong>Totales semana</strong></td>");
+            sb.AppendLine($"<td><strong>{totalOnHours:F2}</strong></td>");
+            sb.AppendLine($"<td><strong>{totalActiveHours:F2}</strong></td>");
+            sb.AppendLine($"<td><strong>{totalIdleHours:F2}</strong></td>");
+            sb.AppendLine("</tr>");
+
+            // Fila de promedios diarios (dividimos entre 7 días)
+            int daysCount = weekly.Days.Count > 0 ? weekly.Days.Count : 1;
+            double avgOn = totalOnHours / daysCount;
+            double avgAct = totalActiveHours / daysCount;
+            double avgIdle = totalIdleHours / daysCount;
+
+            sb.AppendLine("<tr>");
+            sb.AppendLine("<td colspan='2'><strong>Promedio diario</strong></td>");
+            sb.AppendLine($"<td><strong>{avgOn:F2}</strong></td>");
+            sb.AppendLine($"<td><strong>{avgAct:F2}</strong></td>");
+            sb.AppendLine($"<td><strong>{avgIdle:F2}</strong></td>");
+            sb.AppendLine("</tr>");
+
+            sb.AppendLine("</table>");
+
+            // ====== Tabla de aplicaciones semanales ======
+            sb.AppendLine("<h3>Aplicaciones principales (horas en la semana)</h3>");
+
+            if (weekly.Apps == null || weekly.Apps.Count == 0)
+            {
+                sb.AppendLine("<p>No hay aplicaciones registradas en esta semana.</p>");
             }
             else
             {
                 sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
-                sb.AppendLine("<tr><th>#</th><th>Inicio</th><th>Fin</th><th>Total (min)</th><th>Activo</th><th>Idle</th></tr>");
+                sb.AppendLine("<tr><th>Aplicación (proceso)</th><th>Horas en la semana</th></tr>");
 
-                int i = 1;
-                foreach (var s in log.Sessions)
+                foreach (var app in weekly.Apps)
                 {
-                    sb.AppendLine("<tr>");
-                    sb.AppendLine($"<td>{i++}</td>");
-                    sb.AppendLine($"<td>{s.Start:HH:mm:ss}</td>");
-                    sb.AppendLine($"<td>{s.End:HH:mm:ss}</td>");
-                    sb.AppendLine($"<td>{s.TotalMinutes}</td>");
-                    sb.AppendLine($"<td>{s.ActiveMinutes}</td>");
-                    sb.AppendLine($"<td>{s.IdleMinutes}</td>");
-                    sb.AppendLine("</tr>");
-                }
-
-                sb.AppendLine("</table>");
-            }
-
-            // Aplicaciones
-            sb.AppendLine("<h3>Aplicaciones (top por tiempo)</h3>");
-            if (log.Applications == null || log.Applications.Count == 0)
-            {
-                sb.AppendLine("<p>No hay aplicaciones registradas.</p>");
-            }
-            else
-            {
-                sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
-                sb.AppendLine("<tr><th>Proceso</th><th>Minutos</th><th>Primera vez</th><th>Última vez</th></tr>");
-
-                foreach (var app in log.Applications
-                             .OrderByDescending(a => a.TotalMinutes))
-                {
+                    double hours = app.TotalMinutes / 60.0;
                     sb.AppendLine("<tr>");
                     sb.AppendLine($"<td>{app.ProcessName}</td>");
-                    sb.AppendLine($"<td>{app.TotalMinutes}</td>");
-                    sb.AppendLine($"<td>{app.FirstUse:HH:mm}</td>");
-                    sb.AppendLine($"<td>{app.LastUse:HH:mm}</td>");
+                    sb.AppendLine($"<td>{hours:F2}</td>");
                     sb.AppendLine("</tr>");
                 }
 
                 sb.AppendLine("</table>");
             }
 
-            // Sitios web
-            sb.AppendLine("<h3>Sitios web (top por tiempo)</h3>");
-            if (log.Websites == null || log.Websites.Count == 0)
+            // ====== Tabla de sitios web semanales ======
+            sb.AppendLine("<h3>Sitios web principales (horas en la semana)</h3>");
+
+            if (weekly.Sites == null || weekly.Sites.Count == 0)
             {
-                sb.AppendLine("<p>No hay sitios web registrados.</p>");
+                sb.AppendLine("<p>No hay sitios web registrados en esta semana.</p>");
             }
             else
             {
                 sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
-                sb.AppendLine("<tr><th>Sitio</th><th>Minutos</th><th>Primera vez</th><th>Última vez</th></tr>");
+                sb.AppendLine("<tr><th>Sitio / Dominio</th><th>Horas en la semana</th></tr>");
 
-                foreach (var site in log.Websites
-                             .OrderByDescending(w => w.TotalMinutes))
+                foreach (var site in weekly.Sites)
                 {
+                    double hours = site.TotalMinutes / 60.0;
                     sb.AppendLine("<tr>");
                     sb.AppendLine($"<td>{site.Domain}</td>");
-                    sb.AppendLine($"<td>{site.TotalMinutes}</td>");
-                    sb.AppendLine($"<td>{site.FirstUse:HH:mm}</td>");
-                    sb.AppendLine($"<td>{site.LastUse:HH:mm}</td>");
+                    sb.AppendLine($"<td>{hours:F2}</td>");
                     sb.AppendLine("</tr>");
                 }
 
                 sb.AppendLine("</table>");
             }
 
+
             sb.AppendLine("<p style='margin-top:20px;font-size:smaller;color:#666;'>");
-            sb.AppendLine("Reporte generado automáticamente por ZuriFocus.");
+            sb.AppendLine("Reporte semanal generado automáticamente por ZuriFocus.");
             sb.AppendLine("</p>");
 
             sb.AppendLine("</body></html>");
@@ -345,7 +376,22 @@ namespace ZuriFocus.Monitor
             return sb.ToString();
         }
 
-        private static void SendEmailReport(DayLog log, EmailSettings emailSettings)
+        private static string GetSpanishDayName(DayOfWeek day)
+        {
+            return day switch
+            {
+                DayOfWeek.Monday => "Lunes",
+                DayOfWeek.Tuesday => "Martes",
+                DayOfWeek.Wednesday => "Miércoles",
+                DayOfWeek.Thursday => "Jueves",
+                DayOfWeek.Friday => "Viernes",
+                DayOfWeek.Saturday => "Sábado",
+                DayOfWeek.Sunday => "Domingo",
+                _ => day.ToString()
+            };
+        }
+
+        private static void SendEmailReport(WeeklyReportData weekly, EmailSettings emailSettings)
         {
             if (emailSettings.Recipients == null || emailSettings.Recipients.Count == 0)
             {
@@ -353,8 +399,10 @@ namespace ZuriFocus.Monitor
                 return;
             }
 
-            string subject = $"Reporte ZuriFocus - {log.ComputerId} - {log.Date:yyyy-MM-dd}";
-            string bodyHtml = BuildHtmlReportBody(log);
+            string subject = $"Reporte semanal ZuriFocus - {weekly.ComputerId} - " +
+                             $"{weekly.WeekStart:yyyy-MM-dd} al {weekly.WeekEnd:yyyy-MM-dd}";
+
+            string bodyHtml = BuildHtmlReportBody(weekly);
 
             try
             {
@@ -376,16 +424,133 @@ namespace ZuriFocus.Monitor
                 client.Credentials = new NetworkCredential(emailSettings.Username, emailSettings.Password);
 
                 client.Send(message);
-                Console.WriteLine($"Correo de reporte enviado para el día {log.Date:yyyy-MM-dd}.");
+                Console.WriteLine($"Correo de reporte semanal enviado para la semana {weekly.WeekStart:yyyy-MM-dd} - {weekly.WeekEnd:yyyy-MM-dd}.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error al enviar el correo de reporte:");
+                Console.WriteLine("Error al enviar el correo de reporte semanal:");
                 Console.WriteLine(ex.Message);
             }
         }
 
-        private static void MaybeSendDailyReport(MonitorSettings settings, string computerId)
+
+        private static DateTime GetWeekStartMonday(DateTime date)
+        {
+            // DayOfWeek: Sunday = 0, Monday = 1, ...
+            int diff = (7 + (date.DayOfWeek - DayOfWeek.Monday)) % 7;
+            return date.Date.AddDays(-diff);
+        }
+
+        private static WeeklyReportData BuildWeeklyReportData(DateTime weekStart, DateTime weekEnd, string computerId)
+        {
+            var result = new WeeklyReportData
+            {
+                WeekStart = weekStart,
+                WeekEnd = weekEnd,
+                ComputerId = computerId
+            };
+
+            DateTime current = weekStart;
+            string? user = null;
+
+            var appTotals = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var siteTotals = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            while (current <= weekEnd)
+            {
+                var log = LoadDayLogFromFile(current, computerId);
+
+                int totalOn = 0;
+                int active = 0;
+                int idle = 0;
+
+                if (log != null && log.Sessions != null)
+                {
+                    if (user == null && !string.IsNullOrWhiteSpace(log.WindowsUser))
+                        user = log.WindowsUser;
+
+                    foreach (var s in log.Sessions)
+                    {
+                        totalOn += s.TotalMinutes;
+                        active += s.ActiveMinutes;
+                        idle += s.IdleMinutes;
+                    }
+                }
+
+                if (log != null)
+                {
+                    // Acumular aplicaciones de ese día
+                    if (log.Applications != null)
+                    {
+                        foreach (var app in log.Applications)
+                        {
+                            if (app.TotalMinutes <= 0 || string.IsNullOrWhiteSpace(app.ProcessName))
+                                continue;
+
+                            if (!appTotals.ContainsKey(app.ProcessName))
+                                appTotals[app.ProcessName] = 0;
+
+                            appTotals[app.ProcessName] += app.TotalMinutes;
+                        }
+                    }
+
+                    // Acumular sitios de ese día
+                    if (log.Websites != null)
+                    {
+                        foreach (var site in log.Websites)
+                        {
+                            if (site.TotalMinutes <= 0 || string.IsNullOrWhiteSpace(site.Domain))
+                                continue;
+
+                            if (!siteTotals.ContainsKey(site.Domain))
+                                siteTotals[site.Domain] = 0;
+
+                            siteTotals[site.Domain] += site.TotalMinutes;
+                        }
+                    }
+                }
+
+
+                result.Days.Add(new WeeklyDaySummary
+                {
+                    Date = current,
+                    TotalOnMinutes = totalOn,
+                    ActiveMinutes = active,
+                    IdleMinutes = idle
+                });
+
+                current = current.AddDays(1);
+            }
+
+            result.WindowsUser = user ?? "";
+
+            // Convertir diccionarios en listas ordenadas (descendente por minutos)
+            result.Apps = appTotals
+                .OrderByDescending(kv => kv.Value)
+                .Select(kv => new WeeklyAppSummary
+                {
+                    ProcessName = kv.Key,
+                    TotalMinutes = kv.Value
+                })
+                .ToList();
+
+            result.Sites = siteTotals
+                .OrderByDescending(kv => kv.Value)
+                .Select(kv => new WeeklySiteSummary
+                {
+                    Domain = kv.Key,
+                    TotalMinutes = kv.Value
+                })
+                .ToList();
+
+            result.WindowsUser = user ?? "";
+            return result;
+
+
+        }
+
+
+        private static void MaybeSendWeeklyReport(MonitorSettings settings, string computerId)
         {
             if (settings.Email == null || !settings.Email.Enabled)
             {
@@ -394,39 +559,45 @@ namespace ZuriFocus.Monitor
 
             EmailState state = LoadEmailState();
             DateTime today = DateTime.Today;
-            DateTime? lastSent = state.LastReportSentDate;
 
-            // empezamos por el día anterior
-            DateTime candidate = today.AddDays(-1);
-            DateTime minDate = today.AddDays(-7); // límite para no irnos demasiado atrás
+            // Semana actual (donde estamos hoy), empezando en lunes
+            DateTime currentWeekStart = GetWeekStartMonday(today);
 
-            DateTime? dateToSend = null;
+            // Semana anterior: lunes a domingo
+            DateTime lastWeekStart = currentWeekStart.AddDays(-7);
+            DateTime lastWeekEnd = currentWeekStart.AddDays(-1); // domingo anterior
 
-            while (candidate >= minDate)
+            // Si ya enviamos un reporte cuyo "fin" es >= al domingo pasado, no hacemos nada
+            if (state.LastReportSentDate.HasValue &&
+                state.LastReportSentDate.Value >= lastWeekEnd)
             {
-                // si ya enviamos este o uno posterior, paramos
-                if (lastSent.HasValue && candidate <= lastSent.Value)
-                    break;
-
-                var log = LoadDayLogFromFile(candidate, computerId);
-                if (log != null && log.Sessions != null && log.Sessions.Count > 0)
-                {
-                    dateToSend = candidate;
-                    // enviamos este log y salimos
-                    SendEmailReport(log, settings.Email);
-                    state.LastReportSentDate = candidate;
-                    SaveEmailState(state);
-                    break;
-                }
-
-                candidate = candidate.AddDays(-1);
+                Console.WriteLine("Ya se envió el reporte de la semana anterior.");
+                return;
             }
 
-            if (dateToSend == null)
+            // Construimos un resumen semanal para esa semana (lunes-domingo)
+            WeeklyReportData weekly = BuildWeeklyReportData(lastWeekStart, lastWeekEnd, computerId);
+
+            // ¿hubo algo de uso en toda la semana?
+            bool anyUsage = weekly.Days.Exists(d =>
+                d.TotalOnMinutes > 0 || d.ActiveMinutes > 0 || d.IdleMinutes > 0);
+
+            if (!anyUsage)
             {
-                Console.WriteLine("No se encontró ningún día pendiente con logs para enviar por correo.");
+                Console.WriteLine("No hay uso registrado en la semana anterior. No se envía reporte semanal.");
+                return;
             }
+
+            // Enviamos el correo
+            SendEmailReport(weekly, settings.Email);
+
+            // Guardamos que ya enviamos esta semana
+            state.LastReportSentDate = lastWeekEnd;
+            SaveEmailState(state);
+
+
         }
+
 
 
 
@@ -544,6 +715,37 @@ namespace ZuriFocus.Monitor
         public int TotalMinutes { get; set; }
         public DateTime? FirstUse { get; set; }
         public DateTime? LastUse { get; set; }
+    }
+
+    public class WeeklyDaySummary
+    {
+        public DateTime Date { get; set; }
+        public int TotalOnMinutes { get; set; }
+        public int ActiveMinutes { get; set; }
+        public int IdleMinutes { get; set; }
+    }
+
+    public class WeeklyReportData
+    {
+        public DateTime WeekStart { get; set; }  // lunes
+        public DateTime WeekEnd { get; set; }    // domingo
+        public string ComputerId { get; set; } = "";
+        public string WindowsUser { get; set; } = "";
+        public List<WeeklyDaySummary> Days { get; set; } = new();
+        public List<WeeklyAppSummary> Apps { get; set; } = new();
+        public List<WeeklySiteSummary> Sites { get; set; } = new();
+    }
+
+    public class WeeklyAppSummary
+    {
+        public string ProcessName { get; set; } = "";
+        public int TotalMinutes { get; set; }
+    }
+
+    public class WeeklySiteSummary
+    {
+        public string Domain { get; set; } = "";
+        public int TotalMinutes { get; set; }
     }
 
     // ==================== IdleTracker ====================
