@@ -119,11 +119,23 @@ namespace ZuriFocus.Monitor
             Console.ReadLine();
         }
 
+        private static string GetDataRootDirectory()
+        {
+            string dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "ZuriFocus");
+
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+
+
         // ==================== Manejo de DayLog ====================
 
         private static string GetLogFilePath(DateTime date, string computerId)
         {
-            string logsFolder = Path.Combine(AppContext.BaseDirectory, "logs");
+            string logsFolder = Path.Combine(GetDataRootDirectory(), "logs");
             Directory.CreateDirectory(logsFolder);
 
             string fileName = $"{date:yyyy-MM-dd}-{computerId}.json";
@@ -175,66 +187,75 @@ namespace ZuriFocus.Monitor
 
         private static MonitorSettings LoadSettings()
         {
-            string filePath = Path.Combine(AppContext.BaseDirectory, "settings.json");
+            string dataRoot = GetDataRootDirectory();
+            string settingsPath = Path.Combine(dataRoot, "settings.json");
 
-            // Si no existe, creamos uno con valores por defecto
-            if (!File.Exists(filePath))
+            // Si NO existe en ProgramData, intentamos copiar el que está junto al exe
+            if (!File.Exists(settingsPath))
             {
-                var defaultSettings = new MonitorSettings();
-                var options = new JsonSerializerOptions { WriteIndented = true };
-                string defaultJson = JsonSerializer.Serialize(defaultSettings, options);
-                File.WriteAllText(filePath, defaultJson);
+                string exeDir = AppContext.BaseDirectory;
+                string initialSettings = Path.Combine(exeDir, "settings.json");
 
-                Console.WriteLine("No se encontró settings.json. Se creó uno con valores por defecto.");
-                Console.WriteLine($"Umbral de idle: {defaultSettings.IdleThresholdSeconds} segundos");
+                if (File.Exists(initialSettings))
+                {
+                    Directory.CreateDirectory(dataRoot);
+                    File.Copy(initialSettings, settingsPath, overwrite: false);
+                }
+            }
+
+            // Si sigue sin existir, creamos uno por defecto
+            if (!File.Exists(settingsPath))
+            {
+                var defaultSettings = new MonitorSettings
+                {
+                    IdleThresholdSeconds = 60,
+                    Email = new EmailSettings
+                    {
+                        Enabled = false,
+                        SmtpHost = "",
+                        SmtpPort = 587,
+                        UseSsl = true,
+                        FromAddress = "",
+                        FromName = "ZuriFocus",
+                        Username = "",
+                        Password = "",
+                        Recipients = new List<string>()
+                    }
+                };
+
+                string jsonDefault = JsonSerializer.Serialize(defaultSettings, new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                File.WriteAllText(settingsPath, jsonDefault);
                 return defaultSettings;
             }
 
-            try
-            {
-                string json = File.ReadAllText(filePath);
-                var settings = JsonSerializer.Deserialize<MonitorSettings>(json);
-                if (settings == null)
-                    throw new Exception("settings.json deserializado como null.");
-
-                Console.WriteLine($"Configuración cargada. Umbral de idle: {settings.IdleThresholdSeconds} segundos");
-                return settings;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Error al leer settings.json. Usando valores por defecto.");
-                Console.WriteLine(ex.Message);
-                return new MonitorSettings();
-            }
+            // Leer el settings real
+            string json = File.ReadAllText(settingsPath);
+            var settings = JsonSerializer.Deserialize<MonitorSettings>(json);
+            return settings ?? new MonitorSettings();
         }
+
 
         private static EmailState LoadEmailState()
         {
-            string filePath = Path.Combine(AppContext.BaseDirectory, "email_state.json");
-
-            if (!File.Exists(filePath))
-            {
-                return new EmailState(); // sin fecha aún
-            }
-
-            try
-            {
-                string json = File.ReadAllText(filePath);
-                var state = JsonSerializer.Deserialize<EmailState>(json);
-                return state ?? new EmailState();
-            }
-            catch
-            {
+            string path = Path.Combine(GetDataRootDirectory(), "email_state.json");
+            if (!File.Exists(path))
                 return new EmailState();
-            }
+
+            string json = File.ReadAllText(path);
+            return JsonSerializer.Deserialize<EmailState>(json) ?? new EmailState();
         }
 
         private static void SaveEmailState(EmailState state)
         {
-            string filePath = Path.Combine(AppContext.BaseDirectory, "email_state.json");
-            var options = new JsonSerializerOptions { WriteIndented = true };
-            string json = JsonSerializer.Serialize(state, options);
-            File.WriteAllText(filePath, json);
+            string path = Path.Combine(GetDataRootDirectory(), "email_state.json");
+            string json = JsonSerializer.Serialize(state, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+            File.WriteAllText(path, json);
         }
 
         private static DayLog? LoadDayLogFromFile(DateTime date, string computerId)
