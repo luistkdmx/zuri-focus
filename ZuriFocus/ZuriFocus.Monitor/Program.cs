@@ -284,37 +284,48 @@ namespace ZuriFocus.Monitor
                 totalActiveHours += actH;
                 totalIdleHours += idleH;
 
+                string onText = FormatMinutesAsHoursAndMinutes(d.TotalOnMinutes);
+                string actText = FormatMinutesAsHoursAndMinutes(d.ActiveMinutes);
+                string idleText = FormatMinutesAsHoursAndMinutes(d.IdleMinutes);
+
                 string dayName = GetSpanishDayName(d.Date.DayOfWeek);
 
                 sb.AppendLine("<tr>");
                 sb.AppendLine($"<td>{i + 1}</td>");
                 sb.AppendLine($"<td>{dayName} {d.Date:dd/MM}</td>");
-                sb.AppendLine($"<td>{onH:F2}</td>");
-                sb.AppendLine($"<td>{actH:F2}</td>");
-                sb.AppendLine($"<td>{idleH:F2}</td>");
+                sb.AppendLine($"<td>{onText}</td>");
+                sb.AppendLine($"<td>{actText}</td>");
+                sb.AppendLine($"<td>{idleText}</td>");
                 sb.AppendLine("</tr>");
             }
+
+            int totalOnMinutes = (int)Math.Round(totalOnHours * 60);
+            int totalActiveMinutes = (int)Math.Round(totalActiveHours * 60);
+            int totalIdleMinutes = (int)Math.Round(totalIdleHours * 60);
+
 
             // Fila de totales
             sb.AppendLine("<tr>");
             sb.AppendLine("<td colspan='2'><strong>Totales semana</strong></td>");
-            sb.AppendLine($"<td><strong>{totalOnHours:F2}</strong></td>");
-            sb.AppendLine($"<td><strong>{totalActiveHours:F2}</strong></td>");
-            sb.AppendLine($"<td><strong>{totalIdleHours:F2}</strong></td>");
+            sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(totalOnMinutes)}</strong></td>");
+            sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(totalActiveMinutes)}</strong></td>");
+            sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(totalIdleMinutes)}</strong></td>");
             sb.AppendLine("</tr>");
+
 
             // Fila de promedios diarios (dividimos entre 7 días)
             int daysCount = weekly.Days.Count > 0 ? weekly.Days.Count : 1;
-            double avgOn = totalOnHours / daysCount;
-            double avgAct = totalActiveHours / daysCount;
-            double avgIdle = totalIdleHours / daysCount;
+            int avgOnMinutes = (int)Math.Round(totalOnMinutes / (double)daysCount);
+            int avgActMinutes = (int)Math.Round(totalActiveMinutes / (double)daysCount);
+            int avgIdleMinutes = (int)Math.Round(totalIdleMinutes / (double)daysCount);
 
             sb.AppendLine("<tr>");
             sb.AppendLine("<td colspan='2'><strong>Promedio diario</strong></td>");
-            sb.AppendLine($"<td><strong>{avgOn:F2}</strong></td>");
-            sb.AppendLine($"<td><strong>{avgAct:F2}</strong></td>");
-            sb.AppendLine($"<td><strong>{avgIdle:F2}</strong></td>");
+            sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(avgOnMinutes)}</strong></td>");
+            sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(avgActMinutes)}</strong></td>");
+            sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(avgIdleMinutes)}</strong></td>");
             sb.AppendLine("</tr>");
+
 
             sb.AppendLine("</table>");
 
@@ -335,7 +346,7 @@ namespace ZuriFocus.Monitor
                     double hours = app.TotalMinutes / 60.0;
                     sb.AppendLine("<tr>");
                     sb.AppendLine($"<td>{app.ProcessName}</td>");
-                    sb.AppendLine($"<td>{hours:F2}</td>");
+                    sb.AppendLine($"<td>{FormatMinutesAsHoursAndMinutes(app.TotalMinutes)}</td>");
                     sb.AppendLine("</tr>");
                 }
 
@@ -359,7 +370,7 @@ namespace ZuriFocus.Monitor
                     double hours = site.TotalMinutes / 60.0;
                     sb.AppendLine("<tr>");
                     sb.AppendLine($"<td>{site.Domain}</td>");
-                    sb.AppendLine($"<td>{hours:F2}</td>");
+                    sb.AppendLine($"<td>{FormatMinutesAsHoursAndMinutes(site.TotalMinutes)}</td>");
                     sb.AppendLine("</tr>");
                 }
 
@@ -390,6 +401,21 @@ namespace ZuriFocus.Monitor
                 _ => day.ToString()
             };
         }
+
+        private static string FormatMinutesAsHoursAndMinutes(int totalMinutes)
+        {
+            int hours = totalMinutes / 60;
+            int minutes = totalMinutes % 60;
+            return $"{hours:D2}:{minutes:D2}";
+        }
+
+        private static string FormatHours(double hours)
+        {
+            // Convertimos de horas decimales a minutos enteros
+            int totalMinutes = (int)Math.Round(hours * 60);
+            return FormatMinutesAsHoursAndMinutes(totalMinutes);
+        }
+
 
         private static void SendEmailReport(WeeklyReportData weekly, EmailSettings emailSettings)
         {
