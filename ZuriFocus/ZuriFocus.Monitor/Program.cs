@@ -7,6 +7,8 @@ using System.Text;
 using System.Text.Json;
 using System.Net;
 using System.Net.Mail;
+using System.Linq;
+using System.Text.RegularExpressions;
 
 // Alias para evitar conflictos de Timer
 using Timer = System.Timers.Timer;
@@ -680,6 +682,7 @@ namespace ZuriFocus.Monitor
                     log.Websites.Add(new WebsiteUsage
                     {
                         Domain = newSite.Domain,
+                        SampleTitle = newSite.SampleTitle ?? "",
                         TotalMinutes = newSite.TotalMinutes,
                         FirstUse = newSite.FirstUse,
                         LastUse = newSite.LastUse
@@ -700,9 +703,16 @@ namespace ZuriFocus.Monitor
                         if (!existing.LastUse.HasValue || newSite.LastUse > existing.LastUse)
                             existing.LastUse = newSite.LastUse;
                     }
+
+                    // actualizar SampleTitle si el nuevo trae algo (puedes decidir si prefieres mantener el primero)
+                    if (!string.IsNullOrWhiteSpace(newSite.SampleTitle))
+                    {
+                        existing.SampleTitle = newSite.SampleTitle;
+                    }
                 }
             }
         }
+
     }
 
     // ==================== Modelo de datos ====================
@@ -737,11 +747,18 @@ namespace ZuriFocus.Monitor
 
     public class WebsiteUsage
     {
+        // Dominio normalizado, p.ej. "netflix.com", "gmail.com"
         public string Domain { get; set; } = "";
+
+        // Un título representativo de pestaña donde se vio este dominio
+        // p.ej. "Netflix – Google Chrome", "Bandeja de entrada – Gmail"
+        public string SampleTitle { get; set; } = "";
+
         public int TotalMinutes { get; set; }
         public DateTime? FirstUse { get; set; }
         public DateTime? LastUse { get; set; }
     }
+
 
     public class WeeklyDaySummary
     {
@@ -1035,6 +1052,87 @@ namespace ZuriFocus.Monitor
             UpdateElapsed();
         }
 
+        // Mapa básico de palabras clave en el título → dominio
+        private static readonly Dictionary<string, string> TitleKeywordDomainMap =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+        { "YouTube", "youtube.com" },
+        { "Gmail", "gmail.com" },
+        { "Google Drive", "drive.google.com" },
+        { "Google Docs", "docs.google.com" },
+        { "Google Sheets", "sheets.google.com" },
+        { "Google Meet", "meet.google.com" },
+        { "Netflix", "netflix.com" },
+        { "WhatsApp", "web.whatsapp.com" },
+        { "Facebook", "facebook.com" },
+        { "Instagram", "instagram.com" },
+        { "Twitter", "twitter.com" },
+        { "X (formerly Twitter)", "x.com" },
+        { "ChatGPT", "chat.openai.com" },
+        { "Canva", "canva.com" },
+        { "Amazon", "amazon.com" },
+        { "SigmaCap", "sigmacap.mx" },
+        { "Grupozuri", "grupozuri.mx" },
+        { "Kazáh", "kazah.mx" },
+        { "Sigmaplus", "sigmaplus.mx" }
+                // luego podemos agregar más según lo que observes en producción
+            };
+
+        private static readonly Regex DomainRegex =
+            new Regex(@"\b([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b",
+                      RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static string NormalizeDomain(string processName, string title)
+        {
+            if (string.IsNullOrWhiteSpace(title))
+                return "Otros";
+
+            // 1) Intentar encontrar un dominio "real" en el título (algo.com, algo.com.mx, etc.)
+            var match = DomainRegex.Match(title);
+            if (match.Success)
+            {
+                string rawDomain = match.Value.ToLowerInvariant();
+                return SimplifyDomain(rawDomain);
+            }
+
+            // 2) Buscar en mapa de palabras clave
+            foreach (var kvp in TitleKeywordDomainMap)
+            {
+                if (title.IndexOf(kvp.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return kvp.Value;
+                }
+            }
+
+            // 3) Como último recurso, agrupar como "Otros (chrome)", "Otros (edge)", etc.
+            string shortProcess = processName.Replace(".exe", "", StringComparison.OrdinalIgnoreCase);
+            return $"Otros ({shortProcess})";
+        }
+
+        private static string SimplifyDomain(string domain)
+        {
+            // mail.google.com -> google.com
+            // algo.algo.com.mx -> algo.com.mx
+            var parts = domain.Split('.');
+            if (parts.Length <= 2)
+                return domain;
+
+            string last = parts[^1];
+            string secondLast = parts[^2];
+
+            string[] countryTlds = { "mx", "ar", "br", "cl", "co", "uk", "es", "us" };
+
+            if (countryTlds.Contains(last) && (secondLast == "com" || secondLast == "org" || secondLast == "net"))
+            {
+                // tomamos últimos 3: "algo.com.mx"
+                return string.Join(".", parts.Skip(parts.Length - 3));
+            }
+
+            // en los demás casos, últimos 2: "google.com"
+            return string.Join(".", parts.Skip(parts.Length - 2));
+        }
+
+
+
         private void UpdateElapsed()
         {
             DateTime now = DateTime.Now;
@@ -1048,19 +1146,36 @@ namespace ZuriFocus.Monitor
             var info = GetActiveBrowserAndSite();
             if (info != null)
             {
-                string label = info.Value.SiteLabel;
+                string processName = info.Value.ProcessName;
+                string fullTitle = info.Value.SiteLabel;
+
+                // Normalizamos a dominio agrupable: "netflix.com", "gmail.com", etc.
+                string domain = NormalizeDomain(processName, fullTitle);
+
                 int seconds = (int)Math.Round(elapsedSeconds);
 
-                if (!_sites.TryGetValue(label, out var acc))
+                if (!_sites.TryGetValue(domain, out var acc))
                 {
                     acc = new WebsiteUsageAccumulator();
-                    _sites[label] = acc;
+                    _sites[domain] = acc;
                 }
 
                 acc.Seconds += seconds;
+
                 if (!acc.FirstUse.HasValue)
                     acc.FirstUse = now;
                 acc.LastUse = now;
+
+                // Guardamos algún título representativo (podemos ir actualizando)
+                if (string.IsNullOrWhiteSpace(acc.SampleTitle))
+                {
+                    acc.SampleTitle = fullTitle;
+                }
+                else
+                {
+                    // si quieres siempre el último título visto, usa:
+                    acc.SampleTitle = fullTitle;
+                }
             }
 
             _lastTickTime = now;
@@ -1072,7 +1187,7 @@ namespace ZuriFocus.Monitor
 
             foreach (var kvp in _sites)
             {
-                string label = kvp.Key;
+                string domain = kvp.Key;
                 var acc = kvp.Value;
 
                 int minutes = (int)Math.Round(acc.Seconds / 60.0);
@@ -1080,7 +1195,8 @@ namespace ZuriFocus.Monitor
 
                 result.Add(new WebsiteUsage
                 {
-                    Domain = label, // aquí usamos el "label" (título recortado) como nombre del sitio
+                    Domain = domain,
+                    SampleTitle = acc.SampleTitle ?? "",
                     TotalMinutes = minutes,
                     FirstUse = acc.FirstUse,
                     LastUse = acc.LastUse
@@ -1089,6 +1205,7 @@ namespace ZuriFocus.Monitor
 
             return result;
         }
+
 
         // ------- helpers: ventana activa, título, etc. -------
 
@@ -1116,7 +1233,6 @@ namespace ZuriFocus.Monitor
                 using Process proc = Process.GetProcessById((int)pid);
                 string processName = proc.ProcessName.ToLowerInvariant() + ".exe";
 
-                // si no es un navegador, no contamos
                 bool isBrowser = false;
                 foreach (var b in BrowserProcesses)
                 {
@@ -1128,7 +1244,6 @@ namespace ZuriFocus.Monitor
                 }
                 if (!isBrowser) return null;
 
-                // leemos el título de la ventana
                 StringBuilder sb = new StringBuilder(512);
                 int length = GetWindowText(hWnd, sb, sb.Capacity);
                 if (length <= 0) return null;
@@ -1136,17 +1251,8 @@ namespace ZuriFocus.Monitor
                 string title = sb.ToString().Trim();
                 if (string.IsNullOrWhiteSpace(title)) return null;
 
-                // muchos navegadores ponen "Página - Google Chrome" o similar
-                // nos quedamos con la parte antes del último " - "
-                int dashIndex = title.LastIndexOf(" - ");
-                if (dashIndex > 0)
-                {
-                    title = title.Substring(0, dashIndex).Trim();
-                }
-
-                // si quedó muy largo, recortamos un poco para el reporte
-                if (title.Length > 60)
-                    title = title.Substring(0, 60) + "...";
+                if (title.Length > 200)
+                    title = title.Substring(0, 200);
 
                 return (processName, title);
             }
@@ -1156,12 +1262,17 @@ namespace ZuriFocus.Monitor
             }
         }
 
+
         private class WebsiteUsageAccumulator
         {
             public int Seconds;
             public DateTime? FirstUse;
             public DateTime? LastUse;
+
+            // guardamos algún título completo visto para este dominio
+            public string SampleTitle { get; set; } = "";
         }
+
     }
     // ==================== Configuración ====================
 
