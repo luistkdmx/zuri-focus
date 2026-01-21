@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.Mail;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 // Alias para evitar conflictos de Timer
 using Timer = System.Timers.Timer;
@@ -18,106 +19,358 @@ namespace ZuriFocus.Monitor
 {
     internal class Program
     {
+        private static DayLog? _currentDayLog;
+        private static Session? _currentSession;
+        private static IdleTracker? _idleTracker;
+        private static AppTracker? _appTracker;
+        private static WebsiteTracker? _websiteTracker;
+
+        // Timer para autosave
+        private static Timer? _saveTimer;
+
+        // Para no duplicar minutos al guardar muchas veces
+        private static readonly Dictionary<string, int> _lastSavedAppMinutes = new();
+        private static readonly Dictionary<string, int> _lastSavedWebsiteMinutes = new();
+
+        // Configuración y datos del equipo (para usar en cualquier parte)
+        private static MonitorSettings? _settings;
+        private static string _computerId = "";
+        private static string _windowsUser = "";
+
         static void Main(string[] args)
         {
-            Console.Title = "ZuriFocus Monitor - Sesión con activo/idle, apps y sitios";
-            Console.WriteLine("ZuriFocus Monitor iniciado...");
-            Console.WriteLine();
+            // 1) Log rápido de arranque
+            try
+            {
+                var dataRoot = GetDataRootDirectory();
+                var logPath = Path.Combine(dataRoot, "monitor_startup.log");
+                File.AppendAllText(logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - Monitor arrancó{Environment.NewLine}");
+            }
+            catch
+            {
+                // No queremos que falle por esto
+            }
 
             DateTime today = DateTime.Today;
             string computerId = Environment.MachineName;
             string windowsUser = Environment.UserName;
 
-
-            // 1) Cargar configuración
+            // 2) Cargar settings (idle, correo, etc.)
             MonitorSettings settings = LoadSettings();
 
-            // 2) Intentar enviar reporte del último día pendiente
-            MaybeSendWeeklyReport(settings, computerId);
+            // Guardamos en campos estáticos para usarlos en otras funciones
+            _settings = settings;
+            _computerId = computerId;
+            _windowsUser = windowsUser;
 
-            // 3) Cargar DayLog de hoy y continuar como ya lo tenías
-            DayLog todayLog = LoadDayLogOrCreate(today, computerId, windowsUser);
+            MaybeSendInstallNotification(settings, computerId);
 
-            // 4) Crear sesión
-            Session currentSession = new Session
+            // 3) Intentar enviar reporte DIARIO del día anterior
+            MaybeSendDailyReport(today);
+
+            // 4) Cargar o crear DayLog de hoy
+            _currentDayLog = LoadDayLogOrCreate(today, computerId, windowsUser);
+
+            // 5) Crear sesión de esta ejecución (login actual)
+            _currentSession = new Session
             {
                 Start = DateTime.Now
             };
+            _currentDayLog.Sessions.Add(_currentSession);
 
-            Console.WriteLine($"Equipo : {todayLog.ComputerId}");
-            Console.WriteLine($"Usuario: {todayLog.WindowsUser}");
-            Console.WriteLine($"Inicio : {currentSession.Start:yyyy-MM-dd HH:mm:ss}");
-            Console.WriteLine();
-            Console.WriteLine("Monitoreando sesión actual...");
-            Console.WriteLine(" - Idle : si pasan 60 s sin mover mouse/teclado -> inactivo.");
-            Console.WriteLine(" - Apps : se mide qué proceso está en primer plano.");
-            Console.WriteLine(" - Web  : se mide sitio activo usando el título de la pestaña.");
-            Console.WriteLine("Cuando quieras terminar la sesión, presiona ENTER.");
-            Console.WriteLine();
+            // 6) Crear trackers
+            _idleTracker = new IdleTracker(settings.IdleThresholdSeconds);
+            _appTracker = new AppTracker();
+            _websiteTracker = new WebsiteTracker();
 
-            Stopwatch stopwatch = Stopwatch.StartNew();
+            _idleTracker.Start();
+            _appTracker.Start();
+            _websiteTracker.Start();
 
-            var idleTracker = new IdleTracker(settings.IdleThresholdSeconds);
-            var appTracker = new AppTracker();
-            var websiteTracker = new WebsiteTracker();
+            // 7) Hacer un primer guardado inmediato para que exista ya el JSON
+            UpdateAndSaveNow();
 
-            idleTracker.Start();
-            appTracker.Start();
-            websiteTracker.Start();
+            // 8) Configurar timer para autosave cada 60 s
+            _saveTimer = new Timer(60_000); // 60,000 ms = 1 minuto
+            _saveTimer.AutoReset = true;
+            _saveTimer.Elapsed += (s, e) => UpdateAndSaveNow();
+            _saveTimer.Start();
 
-            Console.ReadLine(); // Esperamos fin de la sesión
-
-            // Parar trackers
-            stopwatch.Stop();
-            idleTracker.Stop();
-            appTracker.Stop();
-            websiteTracker.Stop();
-
-            currentSession.End = DateTime.Now;
-            currentSession.ActiveMinutes = (int)Math.Round(idleTracker.ActiveSeconds / 60.0);
-            currentSession.IdleMinutes = (int)Math.Round(idleTracker.IdleSeconds / 60.0);
-
-            // 3) Agregar sesión al DayLog
-            todayLog.Sessions.Add(currentSession);
-
-            // 4) Aplicaciones
-            List<AppUsage> appUsages = appTracker.GetAppUsageMinutes();
-            MergeApplications(todayLog, appUsages);
-
-            // 5) Sitios web
-            List<WebsiteUsage> websiteUsages = websiteTracker.GetWebsiteUsageMinutes();
-            MergeWebsites(todayLog, websiteUsages);
-
-            // 6) Guardar
-            SaveDayLog(todayLog);
-
-            // --- Resumen en consola ---
-            Console.WriteLine();
-            Console.WriteLine("Sesión registrada:");
-            Console.WriteLine($"  Inicio      : {currentSession.Start:HH:mm:ss}");
-            Console.WriteLine($"  Fin         : {currentSession.End:HH:mm:ss}");
-            Console.WriteLine($"  Total       : {currentSession.TotalMinutes} min");
-            Console.WriteLine($"  Activo      : {currentSession.ActiveMinutes} min");
-            Console.WriteLine($"  Idle (aprox): {currentSession.IdleMinutes} min");
-            Console.WriteLine();
-
-            Console.WriteLine("Uso de aplicaciones en esta ejecución:");
-            foreach (var app in appUsages)
-            {
-                Console.WriteLine($"  {app.ProcessName,-20} -> {app.TotalMinutes} min");
-            }
-            Console.WriteLine();
-
-            Console.WriteLine("Sitios web en esta ejecución:");
-            foreach (var site in websiteUsages)
-            {
-                Console.WriteLine($"  {site.Domain,-30} -> {site.TotalMinutes} min");
-            }
-
-            Console.WriteLine();
-            Console.WriteLine("Log actualizado en la carpeta 'logs'. Presiona ENTER para salir.");
-            Console.ReadLine();
+            // 9) Mantener el proceso vivo "en segundo plano"
+            Thread.Sleep(Timeout.Infinite);
         }
+
+        private static void MaybeSendInstallNotification(MonitorSettings settings, string computerId)
+        {
+            if (settings.Email == null || !settings.Email.Enabled)
+                return;
+
+            if (settings.Email.Recipients == null || settings.Email.Recipients.Count == 0)
+                return;
+
+            EmailState state = LoadEmailState();
+
+            // Si ya se envió una vez, no volver a enviar
+            if (state.InstallNotificationDate.HasValue)
+            {
+                Console.WriteLine("La notificación de instalación ya fue enviada anteriormente.");
+                return;
+            }
+
+            string subject = $"ZuriFocus instalado en {computerId}";
+
+            string bodyHtml = $@"
+<html>
+<body>
+    <h2>ZuriFocus instalado</h2>
+    <p>El sistema <strong>ZuriFocus</strong> ha sido instalado en el equipo: <strong>{computerId}</strong>.</p>
+    <p>A partir de mañana comenzará a recibir los reportes de uso diario de este equipo.</p>
+    <p style='margin-top:20px;font-size:smaller;color:#666;'>
+        Mensaje automático generado por ZuriFocus.
+    </p>
+</body>
+</html>";
+
+            try
+            {
+                using var message = new MailMessage();
+                message.From = new MailAddress(settings.Email.FromAddress, settings.Email.FromName);
+
+                foreach (var to in settings.Email.Recipients)
+                {
+                    if (!string.IsNullOrWhiteSpace(to))
+                        message.To.Add(to);
+                }
+
+                message.Subject = subject;
+                message.Body = bodyHtml;
+                message.IsBodyHtml = true;
+
+                using var client = new SmtpClient(settings.Email.SmtpHost, settings.Email.SmtpPort);
+                client.EnableSsl = settings.Email.UseSsl;
+                client.Credentials = new NetworkCredential(settings.Email.Username, settings.Email.Password);
+
+                client.Send(message);
+                Console.WriteLine($"Correo de instalación enviado para el equipo {computerId}.");
+
+                // Marcamos como enviado
+                state.InstallNotificationDate = DateTime.Now;
+                SaveEmailState(state);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error al enviar el correo de instalación:");
+                Console.WriteLine(ex.Message);
+            }
+        }
+
+
+        private static void MaybeSendDailyReport(DateTime today)
+        {
+            // Necesitamos settings y computerId inicializados
+            if (_settings == null || _settings.Email == null || !_settings.Email.Enabled)
+                return;
+
+            if (_settings.Email.Recipients == null || _settings.Email.Recipients.Count == 0)
+                return;
+
+            if (string.IsNullOrWhiteSpace(_computerId))
+                _computerId = Environment.MachineName;
+
+            EmailState state = LoadEmailState();
+
+            // Día a reportar: AYER respecto a "today"
+            DateTime targetDate = today.Date.AddDays(-1);
+
+            // Si ya enviamos un reporte para ese día (o uno posterior), no repetimos
+            if (state.LastReportSentDate.HasValue &&
+                state.LastReportSentDate.Value.Date >= targetDate)
+            {
+                Console.WriteLine($"Ya se envió el reporte para {targetDate:yyyy-MM-dd}.");
+                return;
+            }
+
+            // Cargar el log del día a reportar
+            var log = LoadDayLogFromFile(targetDate, _computerId);
+            if (log == null)
+            {
+                Console.WriteLine($"No hay log para el día {targetDate:yyyy-MM-dd}. No se envía reporte diario.");
+                return;
+            }
+
+            // Ver si hubo algo de uso
+            bool anyUsage = false;
+
+            if (log.Sessions != null && log.Sessions.Count > 0)
+            {
+                foreach (var s in log.Sessions)
+                {
+                    if (s.TotalMinutes > 0 || s.ActiveMinutes > 0 || s.IdleMinutes > 0)
+                    {
+                        anyUsage = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!anyUsage && log.Applications != null && log.Applications.Count > 0)
+            {
+                anyUsage = log.Applications.Any(a => a.TotalMinutes > 0);
+            }
+
+            if (!anyUsage && log.Websites != null && log.Websites.Count > 0)
+            {
+                anyUsage = log.Websites.Any(w => w.TotalMinutes > 0);
+            }
+
+            if (!anyUsage)
+            {
+                Console.WriteLine($"No hay uso registrado el día {targetDate:yyyy-MM-dd}. No se envía reporte diario.");
+                return;
+            }
+
+            // Enviar correo del día
+            SendDailyReport(log, _settings.Email);
+
+            // Guardar que ya lo mandamos
+            state.LastReportSentDate = targetDate;
+            SaveEmailState(state);
+        }
+
+
+
+        private static void UpdateAndSaveNow()
+        {
+            if (_currentDayLog == null || _currentSession == null ||
+                _idleTracker == null || _appTracker == null || _websiteTracker == null)
+                return;
+
+            try
+            {
+                DateTime now = DateTime.Now;
+
+                // 🔹 0) Detectar cambio de día (por ejemplo, cruzar de 10 a 11 de diciembre)
+                if (now.Date != _currentDayLog.Date.Date)
+                {
+                    HandleDayChange(now);
+                }
+
+                // 🔹 1) Actualizar la sesión actual con activo/idle
+                _currentSession.End = now;
+                _currentSession.ActiveMinutes = (int)Math.Round(_idleTracker.ActiveSeconds / 60.0);
+                _currentSession.IdleMinutes = (int)Math.Round(_idleTracker.IdleSeconds / 60.0);
+
+                // 🔹 2) Obtener uso TOTAL de apps desde que se inició esta ejecución
+                var allApps = _appTracker.GetAppUsageMinutes();
+                var deltaApps = new List<AppUsage>();
+
+                foreach (var app in allApps)
+                {
+                    int last = 0;
+                    _lastSavedAppMinutes.TryGetValue(app.ProcessName, out last);
+
+                    int delta = app.TotalMinutes - last;
+                    if (delta <= 0) continue; // nada nuevo
+
+                    deltaApps.Add(new AppUsage
+                    {
+                        ProcessName = app.ProcessName,
+                        TotalMinutes = delta,
+                        FirstUse = app.FirstUse,
+                        LastUse = app.LastUse
+                    });
+
+                    _lastSavedAppMinutes[app.ProcessName] = app.TotalMinutes;
+                }
+
+                MergeApplications(_currentDayLog, deltaApps);
+
+                // 🔹 3) Sitios web (dominios) - mismo patrón de delta
+                var allSites = _websiteTracker.GetWebsiteUsageMinutes();
+                var deltaSites = new List<WebsiteUsage>();
+
+                foreach (var site in allSites)
+                {
+                    if (string.IsNullOrWhiteSpace(site.Domain)) continue;
+
+                    int last = 0;
+                    _lastSavedWebsiteMinutes.TryGetValue(site.Domain, out last);
+                    int delta = site.TotalMinutes - last;
+                    if (delta <= 0) continue;
+
+                    deltaSites.Add(new WebsiteUsage
+                    {
+                        Domain = site.Domain,
+                        SampleTitle = site.SampleTitle,
+                        TotalMinutes = delta,
+                        FirstUse = site.FirstUse,
+                        LastUse = site.LastUse
+                    });
+
+                    _lastSavedWebsiteMinutes[site.Domain] = site.TotalMinutes;
+                }
+
+                MergeWebsites(_currentDayLog, deltaSites);
+
+                // 🔹 4) Guardar DayLog actual (sobrescribe el archivo del día)
+                SaveDayLog(_currentDayLog);
+            }
+            catch
+            {
+                // Para V1, si algo falla en el autosave no queremos que se caiga el proceso.
+            }
+        }
+
+        /// <summary>
+        /// Se llama cuando detectamos que la fecha actual (now.Date)
+        /// ya no es igual a _currentDayLog.Date.
+        /// Cierra el día anterior y prepara un DayLog nuevo para el día actual.
+        /// </summary>
+        private static void HandleDayChange(DateTime now)
+        {
+            if (_currentDayLog == null || _currentSession == null ||
+                _idleTracker == null || _appTracker == null || _websiteTracker == null)
+                return;
+
+            // 1) Guardar el DayLog del día anterior tal como esté
+            SaveDayLog(_currentDayLog);
+
+            // 2) Enviar el reporte diario del día que acaba de terminar.
+            //    Hoy es now.Date, así que el "día anterior" es el log que acabamos de cerrar.
+            MaybeSendDailyReport(now.Date);
+
+            // 3) Reiniciar trackers para el nuevo día
+            _idleTracker.Reset();
+            _appTracker.Reset();
+            _websiteTracker.Reset();
+
+            _lastSavedAppMinutes.Clear();
+            _lastSavedWebsiteMinutes.Clear();
+
+            // 4) Crear un nuevo DayLog para la fecha actual
+            DateTime today = now.Date;
+
+            // Usamos los datos ya guardados en estáticos si existen
+            string computerId = string.IsNullOrWhiteSpace(_computerId)
+                ? Environment.MachineName
+                : _computerId;
+
+            string windowsUser = string.IsNullOrWhiteSpace(_windowsUser)
+                ? Environment.UserName
+                : _windowsUser;
+
+            _currentDayLog = LoadDayLogOrCreate(today, computerId, windowsUser);
+
+            // 5) Nueva sesión a partir de este momento
+            _currentSession = new Session
+            {
+                Start = now
+            };
+            _currentDayLog.Sessions.Add(_currentSession);
+        }
+
+
+
 
         private static string GetDataRootDirectory()
         {
@@ -211,14 +464,14 @@ namespace ZuriFocus.Monitor
                     IdleThresholdSeconds = 60,
                     Email = new EmailSettings
                     {
-                        Enabled = false,
-                        SmtpHost = "",
+                        Enabled = true,
+                        SmtpHost = "mail.grupozuri.mx",
                         SmtpPort = 587,
-                        UseSsl = true,
-                        FromAddress = "",
-                        FromName = "ZuriFocus",
-                        Username = "",
-                        Password = "",
+                        UseSsl = false,
+                        FromAddress = "operaciones@grupozuri.mx",
+                        FromName = "ZuriFocus Reporte",
+                        Username = "operaciones@grupozuri.mx",
+                        Password = "r2ASzTztjo",
                         Recipients = new List<string>()
                     }
                 };
@@ -273,6 +526,131 @@ namespace ZuriFocus.Monitor
                 return null;
             }
         }
+
+        private static string BuildDailyHtmlReportBody(DayLog log)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("<html><body>");
+            sb.AppendLine($"<h2>Reporte diario ZuriFocus - {log.ComputerId}</h2>");
+            sb.AppendLine($"<p><strong>Fecha:</strong> {log.Date:yyyy-MM-dd}</p>");
+
+            if (!string.IsNullOrWhiteSpace(log.WindowsUser))
+            {
+                sb.AppendLine($"<p><strong>Usuario:</strong> {log.WindowsUser}</p>");
+            }
+
+            // ====== Sesiones del día ======
+            sb.AppendLine("<h3>Sesiones del día</h3>");
+
+            if (log.Sessions == null || log.Sessions.Count == 0)
+            {
+                sb.AppendLine("<p>No hay sesiones registradas en este día.</p>");
+            }
+            else
+            {
+                sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
+                sb.AppendLine("<tr><th>#</th><th>Inicio</th><th>Fin</th><th>Encendido</th><th>Activo</th><th>Idle</th></tr>");
+
+                int index = 1;
+                int totalOn = 0;
+                int totalActive = 0;
+                int totalIdle = 0;
+
+                foreach (var s in log.Sessions.OrderBy(s => s.Start))
+                {
+                    int sessionOn = s.TotalMinutes;
+                    int sessionActive = s.ActiveMinutes;
+                    int sessionIdle = s.IdleMinutes;
+
+                    totalOn += sessionOn;
+                    totalActive += sessionActive;
+                    totalIdle += sessionIdle;
+
+                    sb.AppendLine("<tr>");
+                    sb.AppendLine($"<td>{index}</td>");
+                    sb.AppendLine($"<td>{s.Start:dd/MM HH:mm}</td>");
+                    sb.AppendLine($"<td>{s.End:dd/MM HH:mm}</td>");
+                    sb.AppendLine($"<td>{FormatMinutesAsHoursAndMinutes(sessionOn)}</td>");
+                    sb.AppendLine($"<td>{FormatMinutesAsHoursAndMinutes(sessionActive)}</td>");
+                    sb.AppendLine($"<td>{FormatMinutesAsHoursAndMinutes(sessionIdle)}</td>");
+                    sb.AppendLine("</tr>");
+
+                    index++;
+                }
+
+                // Totales del día
+                sb.AppendLine("<tr>");
+                sb.AppendLine("<td colspan='3'><strong>Totales del día</strong></td>");
+                sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(totalOn)}</strong></td>");
+                sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(totalActive)}</strong></td>");
+                sb.AppendLine($"<td><strong>{FormatMinutesAsHoursAndMinutes(totalIdle)}</strong></td>");
+                sb.AppendLine("</tr>");
+
+                sb.AppendLine("</table>");
+            }
+
+            // ====== Aplicaciones del día ======
+            sb.AppendLine("<h3>Aplicaciones del día</h3>");
+
+            if (log.Applications == null || log.Applications.Count == 0)
+            {
+                sb.AppendLine("<p>No hay aplicaciones registradas en este día.</p>");
+            }
+            else
+            {
+                sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
+                sb.AppendLine("<tr><th>Aplicación (proceso)</th><th>Tiempo</th></tr>");
+
+                foreach (var app in log.Applications
+                                       .OrderByDescending(a => a.TotalMinutes))
+                {
+                    if (app.TotalMinutes <= 0) continue;
+
+                    sb.AppendLine("<tr>");
+                    sb.AppendLine($"<td>{app.ProcessName}</td>");
+                    sb.AppendLine($"<td>{FormatMinutesAsHoursAndMinutes(app.TotalMinutes)}</td>");
+                    sb.AppendLine("</tr>");
+                }
+
+                sb.AppendLine("</table>");
+            }
+
+            // ====== Sitios web del día ======
+            sb.AppendLine("<h3>Sitios web del día</h3>");
+
+            if (log.Websites == null || log.Websites.Count == 0)
+            {
+                sb.AppendLine("<p>No hay sitios web registrados en este día.</p>");
+            }
+            else
+            {
+                sb.AppendLine("<table border='1' cellpadding='4' cellspacing='0'>");
+                sb.AppendLine("<tr><th>Sitio / Dominio</th><th>Tiempo</th></tr>");
+
+                foreach (var site in log.Websites
+                                        .OrderByDescending(s => s.TotalMinutes))
+                {
+                    if (site.TotalMinutes <= 0) continue;
+
+                    sb.AppendLine("<tr>");
+                    sb.AppendLine($"<td>{site.Domain}</td>");
+                    sb.AppendLine($"<td>{FormatMinutesAsHoursAndMinutes(site.TotalMinutes)}</td>");
+                    sb.AppendLine("</tr>");
+                }
+
+                sb.AppendLine("</table>");
+            }
+
+            sb.AppendLine("<p style='margin-top:20px;font-size:smaller;color:#666;'>");
+            sb.AppendLine("Reporte diario generado automáticamente por ZuriFocus.");
+            sb.AppendLine("</p>");
+
+            sb.AppendLine("</body></html>");
+
+            return sb.ToString();
+        }
+
 
         private static string BuildHtmlReportBody(WeeklyReportData weekly)
         {
@@ -478,6 +856,46 @@ namespace ZuriFocus.Monitor
             catch (Exception ex)
             {
                 Console.WriteLine("Error al enviar el correo de reporte semanal:");
+                Console.WriteLine(ex.Message);
+            }
+        }
+
+        private static void SendDailyReport(DayLog log, EmailSettings emailSettings)
+        {
+            if (emailSettings.Recipients == null || emailSettings.Recipients.Count == 0)
+            {
+                Console.WriteLine("Email.Enabled=true pero no hay destinatarios configurados.");
+                return;
+            }
+
+            string subject = $"Reporte diario ZuriFocus - {log.ComputerId} - {log.Date:yyyy-MM-dd}";
+            string bodyHtml = BuildDailyHtmlReportBody(log);
+
+            try
+            {
+                using var message = new MailMessage();
+                message.From = new MailAddress(emailSettings.FromAddress, emailSettings.FromName);
+
+                foreach (var to in emailSettings.Recipients)
+                {
+                    if (!string.IsNullOrWhiteSpace(to))
+                        message.To.Add(to);
+                }
+
+                message.Subject = subject;
+                message.Body = bodyHtml;
+                message.IsBodyHtml = true;
+
+                using var client = new SmtpClient(emailSettings.SmtpHost, emailSettings.SmtpPort);
+                client.EnableSsl = emailSettings.UseSsl;
+                client.Credentials = new NetworkCredential(emailSettings.Username, emailSettings.Password);
+
+                client.Send(message);
+                Console.WriteLine($"Correo de reporte diario enviado para el día {log.Date:yyyy-MM-dd}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error al enviar el correo diario:");
                 Console.WriteLine(ex.Message);
             }
         }
@@ -850,6 +1268,15 @@ namespace ZuriFocus.Monitor
             _timer.Stop();
         }
 
+        public void Reset()
+        {
+            ActiveSeconds = 0;
+            IdleSeconds = 0;
+            _isCurrentlyIdle = false;
+            _lastTickTime = DateTime.Now;
+        }
+
+
         private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
         {
             UpdateElapsed();
@@ -859,7 +1286,20 @@ namespace ZuriFocus.Monitor
         {
             DateTime now = DateTime.Now;
             double elapsedSeconds = (now - _lastTickTime).TotalSeconds;
-            if (elapsedSeconds < 0) elapsedSeconds = 0;
+
+            if (elapsedSeconds <= 0)
+            {
+                _lastTickTime = now;
+                return;
+            }
+
+            // 🔹 Si el salto es muy grande, asumimos suspensión / hibernación / app pausada
+            //    y NO lo contamos ni como activo ni como idle.
+            if (elapsedSeconds > 300) // 5 minutos; puedes ajustar este umbral
+            {
+                _lastTickTime = now;
+                return;
+            }
 
             bool isIdleNow = IsIdleNow();
 
@@ -875,6 +1315,7 @@ namespace ZuriFocus.Monitor
             _isCurrentlyIdle = isIdleNow;
             _lastTickTime = now;
         }
+
 
         private bool IsIdleNow()
         {
@@ -938,6 +1379,13 @@ namespace ZuriFocus.Monitor
             _timer.Stop();
         }
 
+        public void Reset()
+        {
+            _apps.Clear();
+            _lastTickTime = DateTime.Now;
+        }
+
+
         private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
         {
             UpdateElapsed();
@@ -953,7 +1401,22 @@ namespace ZuriFocus.Monitor
                 return;
             }
 
+            // 🔹 Ignorar saltos muy grandes (suspensión / hibernación)
+            if (elapsedSeconds > 300) // 5 minutos
+            {
+                _lastTickTime = now;
+                return;
+            }
+
             string processName = GetActiveProcessName() ?? "Unknown";
+
+            // 🔹 No queremos contar LockApp.exe como "aplicación de trabajo"
+            if (string.Equals(processName, "LockApp.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                _lastTickTime = now;
+                return;
+            }
+
             int seconds = (int)Math.Round(elapsedSeconds);
 
             if (!_apps.TryGetValue(processName, out var acc))
@@ -1068,6 +1531,13 @@ namespace ZuriFocus.Monitor
             _timer.Stop();
         }
 
+        public void Reset()
+        {
+            _sites.Clear();
+            _lastTickTime = DateTime.Now;
+        }
+
+
         private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
         {
             UpdateElapsed();
@@ -1164,6 +1634,13 @@ namespace ZuriFocus.Monitor
                 return;
             }
 
+            // 🔹 Ignorar saltos muy grandes (suspensión / hibernación)
+            if (elapsedSeconds > 300) // 5 minutos
+            {
+                _lastTickTime = now;
+                return;
+            }
+
             var info = GetActiveBrowserAndSite();
             if (info != null)
             {
@@ -1194,13 +1671,13 @@ namespace ZuriFocus.Monitor
                 }
                 else
                 {
-                    // si quieres siempre el último título visto, usa:
                     acc.SampleTitle = fullTitle;
                 }
             }
 
             _lastTickTime = now;
         }
+
 
         public List<WebsiteUsage> GetWebsiteUsageMinutes()
         {
@@ -1320,7 +1797,11 @@ namespace ZuriFocus.Monitor
     public class EmailState
     {
         public DateTime? LastReportSentDate { get; set; }
+
+        // Nueva bandera: si ya se envió el correo de "ZuriFocus instalado"
+        public DateTime? InstallNotificationDate { get; set; }
     }
+
 
 
 }
